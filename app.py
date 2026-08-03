@@ -1288,7 +1288,7 @@ HEADERS = {
     "client-id": CLIENT_ID,
 }
 
-dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN) if CREDENTIALS_READY else None
+dhan = dhanhq(DhanContext(CLIENT_ID, ACCESS_TOKEN)) if CREDENTIALS_READY else None
 
 
 # =========================================================
