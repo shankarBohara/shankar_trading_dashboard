@@ -16,7 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from dhanhq import dhanhq
+from dhanhq import DhanContext, dhanhq
 
 
 # =========================================================
