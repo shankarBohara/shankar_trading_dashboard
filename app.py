@@ -1,5941 +1,2457 @@
-import base64
-import calendar
-import io
-import math
-import csv
-import os
-import re
-import struct
-import time
-import wave
-import textwrap
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+"""
+Shankar Trading Dashboard V4 Pro
+Research-based Streamlit dashboard for DhanHQ.
 
+Install once:
+    py -m pip install streamlit requests pandas numpy plotly
+
+Run:
+    py -m streamlit run shankar_trading_dashboard_v4_pro.py
+
+Important:
+- This version does NOT place real-money orders.
+- It uses only 5-minute entry analysis and 15-minute confirmation.
+- Live values appear only when a valid Dhan Client ID, Access Token,
+  Data API access, underlying Security ID, and expiry are available.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import time as time_module
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from dhanhq import DhanContext, dhanhq
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 
-# =========================================================
-# PAGE CONFIGURATION
-# =========================================================
+# ---------------------------------------------------------------------
+# APP CONFIG
+# ---------------------------------------------------------------------
+APP_NAME = "Shankar Trading Dashboard"
+APP_VERSION = "V10.3 Pro Terminal"
+DHAN_BASE = "https://api.dhan.co/v2"
+CONFIG_PATH = Path(__file__).with_name(".shankar_dashboard_config.json")
+REQUEST_TIMEOUT = 10
+DHAN_INSTRUMENT_MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
+TARGET_INDEX_ALIASES = {
+    "NIFTY 50": ["NIFTY 50", "NIFTY"],
+    "BANK NIFTY": ["NIFTY BANK", "BANKNIFTY", "BANK NIFTY"],
+    "FINNIFTY": ["NIFTY FIN SERVICE", "FINNIFTY", "NIFTY FINANCIAL SERVICES"],
+    "MIDCAP SELECT": ["NIFTY MID SELECT", "MIDCPNIFTY", "NIFTY MIDCAP SELECT"],
+    "SENSEX": ["SENSEX", "BSE SENSEX"],
+    "BANKEX": ["BANKEX", "BSE BANKEX"],
+    "INDIA VIX": ["INDIA VIX"],
+}
+
+# Dhan's documentation uses Security ID 13 for NIFTY.
+# Other IDs remain editable in the sidebar so the user can verify them
+# against the current Dhan instrument master.
+DEFAULT_MARKETS = {
+    "NIFTY 50": {"security_id": 13, "segment": "IDX_I", "chart_segment": "IDX_I", "instrument": "INDEX"},
+    "BANK NIFTY": {"security_id": 25, "segment": "IDX_I", "chart_segment": "IDX_I", "instrument": "INDEX"},
+    "FINNIFTY": {"security_id": 27, "segment": "IDX_I", "chart_segment": "IDX_I", "instrument": "INDEX"},
+    "MIDCAP SELECT": {"security_id": 442, "segment": "IDX_I", "chart_segment": "IDX_I", "instrument": "INDEX"},
+}
 
 st.set_page_config(
-    page_title="Shankar Trading Dashboard",
-    page_icon="📊",
+    page_title=APP_NAME,
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
+# ---------------------------------------------------------------------
+# STYLING
+# ---------------------------------------------------------------------
 st.markdown(
     """
-    <style>
-    .main-title {
-        font-size: clamp(1.7rem, 2.7vw, 2.45rem);
-        font-weight: 850;
-        line-height: 1.18;
-        margin-top: 0.7rem;
-        margin-bottom: 0.25rem;
-        white-space: normal;
-        overflow-wrap: anywhere;
-        word-break: normal;
-    }
-
-    .sub-title {
-        color: #6b7280;
-        margin-bottom: 0.9rem;
-        font-size: clamp(0.82rem, 1vw, 1rem);
-        line-height: 1.35;
-        white-space: normal;
-        overflow-wrap: anywhere;
-    }
-
-    .ce-heading {
-        background: #ffe5e5;
-        color: #a00000;
-        padding: 9px;
-        border-radius: 8px;
-        text-align: center;
-        font-weight: 800;
-    }
-
-    .pe-heading {
-        background: #e6ffeb;
-        color: #006b22;
-        padding: 9px;
-        border-radius: 8px;
-        text-align: center;
-        font-weight: 800;
-    }
-
-    .strike-heading {
-        background: #fff3bf;
-        color: #664d03;
-        padding: 9px;
-        border-radius: 8px;
-        text-align: center;
-        font-weight: 800;
-    }
-
-    .signal-bullish {
-        background: #dcfce7;
-        border: 2px solid #22c55e;
-        color: #166534;
-        padding: 18px;
-        border-radius: 14px;
-        font-weight: 900;
-        text-align: center;
-        font-size: 28px;
-    }
-
-    .signal-bearish {
-        background: #fee2e2;
-        border: 2px solid #ef4444;
-        color: #991b1b;
-        padding: 18px;
-        border-radius: 14px;
-        font-weight: 900;
-        text-align: center;
-        font-size: 28px;
-    }
-
-    .signal-neutral {
-        background: #fef3c7;
-        border: 2px solid #f59e0b;
-        color: #92400e;
-        padding: 18px;
-        border-radius: 14px;
-        font-weight: 900;
-        text-align: center;
-        font-size: 28px;
-    }
-
-    .status-open {
-        background: #dcfce7;
-        border-left: 6px solid #16a34a;
-        padding: 10px;
-        border-radius: 8px;
-        font-weight: 750;
-    }
-
-    .status-closed {
-        background: #fef3c7;
-        border-left: 6px solid #d97706;
-        padding: 10px;
-        border-radius: 8px;
-        font-weight: 750;
-    }
-
-    .alert-breakout {
-        background: #dcfce7;
-        border-left: 6px solid #16a34a;
-        padding: 12px;
-        border-radius: 8px;
-        font-weight: 750;
-    }
-
-    .alert-breakdown {
-        background: #fee2e2;
-        border-left: 6px solid #dc2626;
-        padding: 12px;
-        border-radius: 8px;
-        font-weight: 750;
-    }
-
-    .alert-range {
-        background: #fef3c7;
-        border-left: 6px solid #d97706;
-        padding: 12px;
-        border-radius: 8px;
-        font-weight: 750;
-    }
-
-    div[data-testid="stMetric"] {
-        background: white;
-        border-radius: 12px;
-        padding: 12px;
-        border: 1px solid #e5e7eb;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-    }
-
-    div[data-testid="stMetricValue"] {
-        font-size: clamp(1.05rem, 1.7vw, 1.65rem) !important;
-        white-space: nowrap !important;
-        overflow: visible !important;
-        text-overflow: clip !important;
-        line-height: 1.2 !important;
-    }
-
-    div[data-testid="stMetricLabel"] {
-        font-size: 0.82rem !important;
-        white-space: normal !important;
-    }
-
-    div[data-testid="stMetric"] {
-        min-height: 118px;
-    }
-
-    @media (max-width: 1100px) {
-        div[data-testid="stMetricValue"] {
-            font-size: 1.15rem !important;
-        }
-    }
-
-
-    .terminal-strip {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
-        gap: 0.55rem;
-        margin: 0.4rem 0 0.6rem 0;
-        width: 100%;
-    }
-
-    .terminal-pill {
-        background: #0f172a;
-        color: #f8fafc;
-        border: 1px solid #334155;
-        border-radius: 999px;
-        padding: 0.58rem 0.7rem;
-        font-size: clamp(0.72rem, 0.9vw, 0.86rem);
-        font-weight: 700;
-        text-align: center;
-        white-space: normal;
-        overflow-wrap: anywhere;
-        box-sizing: border-box;
-    }
-
-    .mtf-bullish {
-        background: linear-gradient(135deg, #dcfce7, #bbf7d0);
-        border: 1px solid #22c55e;
-        color: #14532d;
-        padding: 14px;
-        border-radius: 12px;
-        font-weight: 850;
-        text-align: center;
-    }
-
-    .mtf-bearish {
-        background: linear-gradient(135deg, #fee2e2, #fecaca);
-        border: 1px solid #ef4444;
-        color: #7f1d1d;
-        padding: 14px;
-        border-radius: 12px;
-        font-weight: 850;
-        text-align: center;
-    }
-
-    .mtf-neutral {
-        background: linear-gradient(135deg, #fef3c7, #fde68a);
-        border: 1px solid #f59e0b;
-        color: #78350f;
-        padding: 14px;
-        border-radius: 12px;
-        font-weight: 850;
-        text-align: center;
-    }
-
-    section[data-testid="stSidebar"] {
-        border-right: 1px solid #e2e8f0;
-    }
-
-    
-
-
-    .grade-strong-buy {
-        background: linear-gradient(135deg, #dcfce7, #86efac);
-        border: 2px solid #16a34a;
-        color: #14532d;
-        padding: 18px;
-        border-radius: 14px;
-        text-align: center;
-        font-weight: 900;
-        font-size: clamp(1.25rem, 2vw, 1.9rem);
-    }
-
-    .grade-moderate-buy {
-        background: linear-gradient(135deg, #ecfccb, #bef264);
-        border: 2px solid #65a30d;
-        color: #365314;
-        padding: 18px;
-        border-radius: 14px;
-        text-align: center;
-        font-weight: 900;
-        font-size: clamp(1.2rem, 1.8vw, 1.7rem);
-    }
-
-    .grade-wait {
-        background: linear-gradient(135deg, #fef3c7, #fde68a);
-        border: 2px solid #d97706;
-        color: #78350f;
-        padding: 18px;
-        border-radius: 14px;
-        text-align: center;
-        font-weight: 900;
-        font-size: clamp(1.2rem, 1.8vw, 1.7rem);
-    }
-
-    .grade-avoid {
-        background: linear-gradient(135deg, #fee2e2, #fecaca);
-        border: 2px solid #dc2626;
-        color: #7f1d1d;
-        padding: 18px;
-        border-radius: 14px;
-        text-align: center;
-        font-weight: 900;
-        font-size: clamp(1.2rem, 1.8vw, 1.7rem);
-    }
-
-    .professional-note {
-        background: #0f172a;
-        color: #f8fafc;
-        border-radius: 12px;
-        padding: 12px 14px;
-        margin-top: 10px;
-        font-size: 0.9rem;
-    }
-
-
-    html, body, [data-testid="stAppViewContainer"] {
-        width: 100% !important;
-        max-width: 100% !important;
-        overflow-x: clip !important;
-    }
-
-    [data-testid="stAppViewBlockContainer"],
-    .block-container {
-        width: 100% !important;
-        max-width: 100% !important;
-        padding-top: 0.7rem !important;
-        padding-left: 1.2rem !important;
-        padding-right: 1.2rem !important;
-        padding-bottom: 2rem !important;
-        box-sizing: border-box !important;
-    }
-
-    [data-testid="stMain"],
-    [data-testid="stMainBlockContainer"] {
-        width: 100% !important;
-        max-width: 100% !important;
-    }
-
-    [data-testid="stHorizontalBlock"] {
-        width: 100% !important;
-        display: flex !important;
-        flex-wrap: wrap !important;
-        gap: 0.7rem !important;
-        align-items: stretch !important;
-    }
-
-    [data-testid="column"] {
-        min-width: 0 !important;
-        flex: 1 1 210px !important;
-        width: auto !important;
-    }
-
-    div[data-testid="stMetric"] {
-        width: 100% !important;
-        min-width: 0 !important;
-        min-height: 112px !important;
-        padding: 0.78rem !important;
-        box-sizing: border-box !important;
-    }
-
-    div[data-testid="stMetricValue"] {
-        font-size: clamp(1rem, 1.35vw, 1.55rem) !important;
-        line-height: 1.18 !important;
-        white-space: normal !important;
-        overflow-wrap: anywhere !important;
-        word-break: break-word !important;
-        text-overflow: unset !important;
-        overflow: visible !important;
-    }
-
-    div[data-testid="stMetricLabel"] {
-        font-size: clamp(0.72rem, 0.85vw, 0.9rem) !important;
-        line-height: 1.2 !important;
-        white-space: normal !important;
-        overflow-wrap: anywhere !important;
-    }
-
-    .main-title {
-        font-size: clamp(1.7rem, 2.7vw, 2.45rem) !important;
-        line-height: 1.18 !important;
-        white-space: normal !important;
-        overflow-wrap: anywhere !important;
-        margin-top: 0.65rem !important;
-        margin-bottom: 0.25rem !important;
-        padding-top: 0.2rem !important;
-    }
-
-    .sub-title {
-        font-size: clamp(0.8rem, 1vw, 1rem) !important;
-        white-space: normal !important;
-        overflow-wrap: anywhere !important;
-        margin-bottom: 0.8rem !important;
-    }
-
-    .terminal-strip {
-        width: 100% !important;
-        display: grid !important;
-        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)) !important;
-        gap: 0.55rem !important;
-    }
-
-    .terminal-pill {
-        width: 100% !important;
-        box-sizing: border-box !important;
-        text-align: center !important;
-        white-space: normal !important;
-        overflow-wrap: anywhere !important;
-        font-size: clamp(0.72rem, 0.9vw, 0.86rem) !important;
-        padding: 0.58rem 0.7rem !important;
-    }
-
-    .signal-bullish,
-    .signal-bearish,
-    .signal-neutral,
-    .grade-strong-buy,
-    .grade-moderate-buy,
-    .grade-wait,
-    .grade-avoid,
-    .mtf-bullish,
-    .mtf-bearish,
-    .mtf-neutral {
-        width: 100% !important;
-        box-sizing: border-box !important;
-        white-space: normal !important;
-        overflow-wrap: anywhere !important;
-    }
-
-    [data-testid="stDataFrame"] {
-        width: 100% !important;
-        max-width: 100% !important;
-        overflow-x: auto !important;
-    }
-
-    iframe {
-        width: 100% !important;
-        max-width: 100% !important;
-    }
-
-    @media (max-width: 1366px) {
-        [data-testid="column"] {
-            flex: 1 1 190px !important;
-        }
-
-        [data-testid="stAppViewBlockContainer"],
-        .block-container {
-            padding-left: 0.65rem !important;
-            padding-right: 0.65rem !important;
-        }
-
-        div[data-testid="stMetricValue"] {
-            font-size: 1.05rem !important;
-        }
-    }
-
-    @media (max-width: 900px) {
-        [data-testid="column"] {
-            flex: 1 1 170px !important;
-        }
-
-        .terminal-strip {
-            grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)) !important;
-        }
-    }
-
-    @media (max-width: 640px) {
-        [data-testid="column"] {
-            flex: 1 1 100% !important;
-        }
-
-        .terminal-strip {
-            grid-template-columns: 1fr !important;
-        }
-
-        .main-title {
-            font-size: 1.65rem !important;
-        }
-    }
-
-
-    div[data-testid="stMetric"] {
-        min-height: 62px !important;
-        padding: 0.4rem 0.52rem !important;
-        display: flex !important;
-        flex-direction: column !important;
-        justify-content: center !important;
-    }
-
-    div[data-testid="stMetricValue"] {
-        margin-top: 0.15rem !important;
-        margin-bottom: 0 !important;
-        line-height: 1.12 !important;
-    }
-
-    div[data-testid="stMetricLabel"] {
-        margin-bottom: 0 !important;
-        line-height: 1.1 !important;
-    }
-
-    [data-testid="stHorizontalBlock"] {
-        gap: 0.45rem !important;
-        margin-bottom: 0.25rem !important;
-    }
-
-    h1, h2, h3 {
-        margin-top: 0.45rem !important;
-        margin-bottom: 0.45rem !important;
-    }
-
-    .grade-strong-buy,
-    .grade-moderate-buy,
-    .grade-wait,
-    .grade-avoid,
-    .signal-bullish,
-    .signal-bearish,
-    .signal-neutral {
-        padding: 12px !important;
-        margin: 0.45rem 0 !important;
-    }
-
-    .professional-note {
-        padding: 8px 10px !important;
-        margin-top: 0.35rem !important;
-        margin-bottom: 0.35rem !important;
-    }
-
-    .stAlert {
-        padding-top: 0.55rem !important;
-        padding-bottom: 0.55rem !important;
-    }
-
-
-    .live-grid {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 0.45rem;
-        margin-top: 0.35rem;
-        margin-bottom: 0.55rem;
-    }
-
-    .live-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 9px;
-        padding: 0.5rem 0.65rem;
-        min-height: 50px;
-        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-    }
-
-    .live-card-title {
-        font-size: 0.7rem;
-        font-weight: 700;
-        color: #64748b;
-        line-height: 1.05;
-        margin-bottom: 0.12rem;
-    }
-
-    .live-card-value {
-        font-size: 1rem;
-        font-weight: 800;
-        color: #0f172a;
-        line-height: 1.08;
-    }
-
-    @media (max-width: 900px) {
-        .live-grid {
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-        }
-    }
-
-    @media (max-width: 560px) {
-        .live-grid {
-            grid-template-columns: 1fr;
-        }
-    }
-
-
-    :root {
-        --navy: #0f172a;
-        --blue: #1d4ed8;
-        --cyan: #0891b2;
-        --green: #15803d;
-        --amber: #d97706;
-        --red: #b91c1c;
-        --slate: #475569;
-        --panel: #f8fafc;
-        --border: #dbe3ee;
-    }
-
-    [data-testid="stAppViewContainer"] {
-        background:
-            radial-gradient(circle at top right, rgba(29, 78, 216, 0.06), transparent 28%),
-            linear-gradient(180deg, #f8fafc 0%, #eef4fb 100%);
-    }
-
-    .terminal-header {
-        width: 100%;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 1rem;
-        padding: 0.75rem 1rem;
-        margin: 0.15rem 0 0.55rem 0;
-        border-radius: 14px;
-        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 60%, #0369a1 100%);
-        color: white;
-        box-sizing: border-box;
-        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
-        overflow: visible;
-    }
-
-    .terminal-header-left {
-        min-width: 0;
-        flex: 1 1 auto;
-    }
-
-    .terminal-header-title {
-        font-size: clamp(1.45rem, 2.5vw, 2.35rem);
-        font-weight: 900;
-        line-height: 1.15;
-        margin: 0;
-        white-space: normal;
-        overflow-wrap: anywhere;
-        word-break: normal;
-    }
-
-    .terminal-header-subtitle {
-        font-size: clamp(0.75rem, 0.95vw, 0.95rem);
-        opacity: 0.88;
-        margin-top: 0.22rem;
-        line-height: 1.25;
-        white-space: normal;
-    }
-
-    .vix-badge {
-        flex: 0 0 auto;
-        min-width: 145px;
-        padding: 0.65rem 0.85rem;
-        border-radius: 12px;
-        text-align: center;
-        background: rgba(255, 255, 255, 0.12);
-        border: 1px solid rgba(255, 255, 255, 0.25);
-        backdrop-filter: blur(8px);
-    }
-
-    .vix-label {
-        font-size: 0.72rem;
-        font-weight: 800;
-        letter-spacing: 0.08em;
-        opacity: 0.82;
-    }
-
-    .vix-value {
-        font-size: clamp(1.2rem, 1.8vw, 1.65rem);
-        font-weight: 900;
-        line-height: 1.1;
-        margin-top: 0.12rem;
-    }
-
-    .vix-state {
-        font-size: 0.72rem;
-        margin-top: 0.12rem;
-        opacity: 0.9;
-    }
-
-    .status-open {
-        background: linear-gradient(90deg, #dcfce7, #ecfdf5) !important;
-        border-left: 5px solid #16a34a !important;
-        color: #14532d !important;
-    }
-
-    .status-closed {
-        background: linear-gradient(90deg, #fff7ed, #fffbeb) !important;
-        border-left: 5px solid #d97706 !important;
-        color: #78350f !important;
-    }
-
-    .terminal-pill {
-        background: linear-gradient(135deg, #172554, #1e3a8a) !important;
-        border: 1px solid #3b82f6 !important;
-        color: #eff6ff !important;
-        box-shadow: 0 2px 8px rgba(30, 58, 138, 0.15);
-    }
-
-    .live-card {
-        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
-        border: 1px solid var(--border) !important;
-        border-left: 4px solid var(--blue) !important;
-    }
-
-    div[data-testid="stMetric"] {
-        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
-        border: 1px solid var(--border) !important;
-        border-radius: 10px !important;
-        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05) !important;
-    }
-
-    h1, h2, h3 {
-        color: var(--navy) !important;
-    }
-
-    .professional-note {
-        background: linear-gradient(135deg, #0f172a, #1e293b) !important;
-        color: #f8fafc !important;
-        border-left: 4px solid #38bdf8 !important;
-    }
-
-    @media (max-width: 700px) {
-        .terminal-header {
-            align-items: flex-start;
-            flex-direction: column;
-        }
-
-        .vix-badge {
-            width: 100%;
-            min-width: 0;
-            box-sizing: border-box;
-        }
-    }
-
-
-    .terminal-header {
-        position: relative;
-        z-index: 2;
-    }
-
-    .terminal-header-title {
-        max-width: 100%;
-    }
-
-    .stButton > button {
-        border-radius: 10px !important;
-        border: 1px solid #2563eb !important;
-        background: linear-gradient(135deg, #1d4ed8, #0369a1) !important;
-        color: #ffffff !important;
-        font-weight: 800 !important;
-        box-shadow: 0 4px 12px rgba(29, 78, 216, 0.18) !important;
-    }
-
-    .stButton > button:hover {
-        border-color: #0ea5e9 !important;
-        transform: translateY(-1px);
-    }
-
-    [data-testid="stAlert"] {
-        border-radius: 10px !important;
-    }
-
-
-    .live-card:nth-child(1) { border-left-color: #2563eb !important; }
-    .live-card:nth-child(2) { border-left-color: #7c3aed !important; }
-    .live-card:nth-child(3) { border-left-color: #0891b2 !important; }
-    .live-card:nth-child(4) { border-left-color: #059669 !important; }
-    .live-card:nth-child(5) { border-left-color: #d97706 !important; }
-    .live-card:nth-child(6) { border-left-color: #dc2626 !important; }
-
-    div[data-testid="stMetric"]:has(
-        div[data-testid="stMetricValue"]
-    ) {
-        transition: transform 0.15s ease, box-shadow 0.15s ease;
-    }
-
-    div[data-testid="stMetric"]:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.10) !important;
-    }
-
-    .ce-heading {
-        background: linear-gradient(135deg, #fee2e2, #fecaca) !important;
-        border: 1px solid #ef4444 !important;
-    }
-
-    .pe-heading {
-        background: linear-gradient(135deg, #dcfce7, #bbf7d0) !important;
-        border: 1px solid #22c55e !important;
-    }
-
-    .strike-heading {
-        background: linear-gradient(135deg, #fef3c7, #fde68a) !important;
-        border: 1px solid #f59e0b !important;
-    }
-
-    .smc-card {
-        background: #f8fafc;
-        border: 1px solid #cbd5e1;
-        border-radius: 12px;
-        padding: 12px;
-        min-height: 100px;
-    }
-
-    .smc-title {
-        font-size: 0.82rem;
-        color: #64748b;
-        font-weight: 700;
-    }
-
-    .smc-value {
-        font-size: 1.25rem;
-        font-weight: 850;
-        margin-top: 6px;
-    }
-
-    /* V19 responsive header and coloured cross-market cards */
-    .terminal-header {
-        display: grid !important;
-        grid-template-columns: minmax(0, 1fr) minmax(155px, 190px) !important;
-        align-items: center !important;
-        overflow: visible !important;
-    }
-
-    .vix-badge {
-        width: 100% !important;
-        min-width: 0 !important;
-        box-sizing: border-box !important;
-        position: relative !important;
-        z-index: 5 !important;
-    }
-
-    .market-section-title {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 0.75rem;
-        margin: 0.55rem 0 0.25rem;
-    }
-
-    .market-section-note {
-        color: #64748b;
-        font-size: 0.78rem;
-        text-align: right;
-    }
-
-    .live-card.index-card {
-        background: linear-gradient(135deg, #eff6ff, #dbeafe) !important;
-        border-left-color: #2563eb !important;
-    }
-
-    .live-card.gold-card {
-        background: linear-gradient(135deg, #fffbeb, #fde68a) !important;
-        border-left-color: #d97706 !important;
-    }
-
-    .live-card.crude-card {
-        background: linear-gradient(135deg, #f8fafc, #cbd5e1) !important;
-        border-left-color: #334155 !important;
-    }
-
-    .live-card.bitcoin-card {
-        background: linear-gradient(135deg, #fff7ed, #fed7aa) !important;
-        border-left-color: #f97316 !important;
-    }
-
-    .live-card.unavailable-card {
-        background: linear-gradient(135deg, #f8fafc, #e2e8f0) !important;
-        border-left-color: #94a3b8 !important;
-    }
-
-    .live-card-source {
-        margin-top: 0.18rem;
-        font-size: 0.65rem;
-        line-height: 1.1;
-        color: #64748b;
-        font-weight: 650;
-    }
-
-    @media (max-width: 700px) {
-        .terminal-header {
-            grid-template-columns: 1fr !important;
-        }
-        .market-section-title {
-            align-items: flex-start;
-            flex-direction: column;
-        }
-        .market-section-note {
-            text-align: left;
-        }
-    }
-
-
-    /* V19.1 colorful cards */
-    .color-card-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem;margin:.45rem 0 .8rem;width:100%;}
-    .color-card {border-radius:13px;padding:.78rem .9rem;min-height:76px;box-sizing:border-box;border:1px solid rgba(255,255,255,.35);box-shadow:0 5px 14px rgba(15,23,42,.10);display:flex;flex-direction:column;justify-content:center;}
-    .color-card-label {font-size:.76rem;font-weight:800;opacity:.88;margin-bottom:.2rem;}
-    .color-card-value {font-size:clamp(1rem,1.4vw,1.35rem);font-weight:900;line-height:1.15;overflow-wrap:anywhere;}
-    .card-green {background:linear-gradient(135deg,#166534,#22c55e);color:#fff;}
-    .card-red {background:linear-gradient(135deg,#991b1b,#ef4444);color:#fff;}
-    .card-yellow {background:linear-gradient(135deg,#f59e0b,#fde047);color:#422006;}
-    .card-blue {background:linear-gradient(135deg,#1d4ed8,#38bdf8);color:#fff;}
-    .card-purple {background:linear-gradient(135deg,#6d28d9,#a78bfa);color:#fff;}
-    .card-orange {background:linear-gradient(135deg,#c2410c,#fb923c);color:#fff;}
-    [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(6n+1) div[data-testid="stMetric"] {background:linear-gradient(135deg,#dbeafe,#bfdbfe)!important;border-left:5px solid #2563eb!important;}
-    [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(6n+2) div[data-testid="stMetric"] {background:linear-gradient(135deg,#ede9fe,#ddd6fe)!important;border-left:5px solid #7c3aed!important;}
-    [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(6n+3) div[data-testid="stMetric"] {background:linear-gradient(135deg,#cffafe,#a5f3fc)!important;border-left:5px solid #0891b2!important;}
-    [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(6n+4) div[data-testid="stMetric"] {background:linear-gradient(135deg,#dcfce7,#bbf7d0)!important;border-left:5px solid #16a34a!important;}
-    [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(6n+5) div[data-testid="stMetric"] {background:linear-gradient(135deg,#fef3c7,#fde68a)!important;border-left:5px solid #d97706!important;}
-    [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(6n+6) div[data-testid="stMetric"] {background:linear-gradient(135deg,#fee2e2,#fecaca)!important;border-left:5px solid #dc2626!important;}
-
-    /* =====================================================
-       V20 FULL-COLOR TERMINAL + INDIA VIX VISIBILITY FIX
-       ===================================================== */
-    .terminal-header {
-        grid-template-columns: minmax(0, 1fr) 138px !important;
-        width: 100% !important;
-        max-width: 100% !important;
-        padding: .68rem .72rem !important;
-        gap: .65rem !important;
-        overflow: hidden !important;
-        box-sizing: border-box !important;
-    }
-    .terminal-header-left {min-width:0 !important;}
-    .terminal-header-title {font-size:clamp(1.35rem,2.25vw,2.15rem)!important;}
-    .vix-badge {
-        width:138px !important;
-        max-width:138px !important;
-        min-width:138px !important;
-        padding:.55rem .42rem !important;
-        overflow:visible !important;
-        box-sizing:border-box !important;
-    }
-    .vix-label,.vix-value,.vix-state {white-space:normal!important;overflow:visible!important;}
-
-    /* Make all Streamlit metric cards colorful from top to bottom */
-    div[data-testid="stMetric"] {
-        color:#0f172a !important;
-        border-width:1px 1px 1px 5px !important;
-        box-shadow:0 5px 14px rgba(15,23,42,.10)!important;
-    }
-    div[data-testid="stMetricLabel"], div[data-testid="stMetricValue"], div[data-testid="stMetricDelta"] {
-        color:inherit!important;
-    }
-
-    /* Color regular alert/status boxes too */
-    [data-testid="stAlert"] {
-        background:linear-gradient(135deg,#e0f2fe,#bae6fd)!important;
-        border:1px solid #38bdf8!important;
-        color:#0c4a6e!important;
-        box-shadow:0 4px 12px rgba(14,116,144,.10)!important;
-    }
-    [data-testid="stExpander"] {
-        background:linear-gradient(135deg,#f5f3ff,#ede9fe)!important;
-        border:1px solid #a78bfa!important;
-        border-radius:12px!important;
-        overflow:hidden!important;
-    }
-    [data-testid="stDataFrame"], [data-testid="stTable"] {
-        background:linear-gradient(180deg,#ffffff,#eff6ff)!important;
-        border:1px solid #93c5fd!important;
-        border-radius:12px!important;
-        padding:.2rem!important;
-    }
-
-    /* Color custom information cards that were previously white */
-    .smc-card:nth-child(6n+1), .color-card:nth-child(6n+1) {background:linear-gradient(135deg,#dbeafe,#bfdbfe)!important;border-left:5px solid #2563eb!important;color:#172554!important;}
-    .smc-card:nth-child(6n+2), .color-card:nth-child(6n+2) {background:linear-gradient(135deg,#ede9fe,#ddd6fe)!important;border-left:5px solid #7c3aed!important;color:#3b0764!important;}
-    .smc-card:nth-child(6n+3), .color-card:nth-child(6n+3) {background:linear-gradient(135deg,#cffafe,#a5f3fc)!important;border-left:5px solid #0891b2!important;color:#164e63!important;}
-    .smc-card:nth-child(6n+4), .color-card:nth-child(6n+4) {background:linear-gradient(135deg,#dcfce7,#bbf7d0)!important;border-left:5px solid #16a34a!important;color:#14532d!important;}
-    .smc-card:nth-child(6n+5), .color-card:nth-child(6n+5) {background:linear-gradient(135deg,#fef3c7,#fde68a)!important;border-left:5px solid #d97706!important;color:#78350f!important;}
-    .smc-card:nth-child(6n+6), .color-card:nth-child(6n+6) {background:linear-gradient(135deg,#fee2e2,#fecaca)!important;border-left:5px solid #dc2626!important;color:#7f1d1d!important;}
-    .smc-title,.smc-value {color:inherit!important;}
-
-    /* Inputs, paper trading and backtest controls */
-    [data-testid="stNumberInput"], [data-testid="stSelectbox"], [data-testid="stTextInput"] {
-        background:linear-gradient(135deg,#f8fafc,#e0f2fe)!important;
-        border-radius:10px!important;
-        padding:.25rem!important;
-    }
-
-    /* V20.1: ensure the complete INDIA VIX badge is always visible */
-    .terminal-header {
-        display: grid !important;
-        grid-template-columns: minmax(0, 1fr) minmax(170px, 190px) !important;
-        align-items: stretch !important;
-        overflow: visible !important;
-        min-height: 92px !important;
-    }
-    .vix-badge {
-        width: 100% !important;
-        max-width: none !important;
-        min-width: 170px !important;
-        min-height: 76px !important;
-        padding: .65rem .7rem !important;
-        display: flex !important;
-        flex-direction: column !important;
-        align-items: center !important;
-        justify-content: center !important;
-        overflow: visible !important;
-        position: relative !important;
-        z-index: 5 !important;
-    }
-    .vix-label {
-        display: block !important;
-        font-size: .72rem !important;
-        line-height: 1.2 !important;
-        margin: 0 0 .12rem 0 !important;
-        padding: 0 !important;
-        white-space: nowrap !important;
-        overflow: visible !important;
-    }
-    .vix-value {
-        display: block !important;
-        line-height: 1.15 !important;
-        margin: 0 !important;
-        overflow: visible !important;
-    }
-    .vix-state {
-        display: block !important;
-        line-height: 1.2 !important;
-        margin-top: .18rem !important;
-        white-space: normal !important;
-        overflow: visible !important;
-    }
-
-    @media (max-width: 820px) {
-        .terminal-header {
-            grid-template-columns: 1fr !important;
-            overflow: visible !important;
-        }
-        .vix-badge {
-            width: 100% !important;
-            max-width: 100% !important;
-            min-width: 0 !important;
-        }
-    }
-
-    /* V21: prevent Streamlit toolbar from covering the terminal title */
-    [data-testid="stAppViewBlockContainer"], .block-container {
-        padding-top: 2.35rem !important;
-    }
-    .terminal-header {
-        margin-top: .65rem !important;
-        min-height: 108px !important;
-        padding-top: 1rem !important;
-        padding-bottom: .85rem !important;
-    }
-    .terminal-header-title {
-        padding-top: .18rem !important;
-        line-height: 1.25 !important;
-        overflow: visible !important;
-    }
-    .terminal-header-subtitle {
-        line-height: 1.35 !important;
-        overflow: visible !important;
-    }
-    .vix-badge {
-        min-height: 88px !important;
-        align-self: center !important;
-    }
-    /* V22 market calendar and automatic pivot dashboard */
-    .market-calendar-wrap {background:linear-gradient(145deg,#111827,#172554);border:1px solid #334155;border-radius:16px;padding:14px;box-shadow:0 10px 26px rgba(2,6,23,.25);margin:.55rem 0 .8rem;color:#f8fafc;}
-    .market-calendar-title {font-size:1.05rem;font-weight:900;margin-bottom:.5rem;display:flex;justify-content:space-between;gap:.5rem;flex-wrap:wrap;}
-    .market-calendar-grid {display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px;}
-    .cal-head {text-align:center;font-size:.72rem;font-weight:850;color:#93c5fd;padding:5px 2px;}
-    .cal-day {min-height:58px;border-radius:9px;padding:6px;background:linear-gradient(145deg,#1e293b,#0f172a);border:1px solid #334155;font-size:.75rem;box-sizing:border-box;}
-    .cal-empty {background:transparent;border-color:transparent;}
-    .cal-weekend {background:linear-gradient(145deg,#3f1d2e,#1f1724);border-color:#7f1d1d;color:#fecaca;}
-    .cal-holiday {background:linear-gradient(145deg,#78350f,#451a03);border-color:#f59e0b;color:#fef3c7;}
-    .cal-today {outline:2px solid #38bdf8;box-shadow:0 0 0 2px rgba(56,189,248,.15);}
-    .cal-number {font-size:.82rem;font-weight:900;}
-    .cal-note {font-size:.58rem;line-height:1.15;margin-top:4px;overflow-wrap:anywhere;}
-    .pivot-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:.55rem;margin:.5rem 0 .8rem;}
-    .pivot-card {border-radius:12px;padding:.7rem .75rem;border:1px solid #334155;box-shadow:0 5px 15px rgba(2,6,23,.18);background:linear-gradient(145deg,#1e293b,#0f172a);color:#f8fafc;}
-    .pivot-label {font-size:.7rem;font-weight:800;color:#94a3b8;}
-    .pivot-value {font-size:1.1rem;font-weight:900;margin-top:.12rem;}
-    .pivot-resistance {border-left:5px solid #ef4444;background:linear-gradient(145deg,#3f1d2e,#1f1724);}
-    .pivot-support {border-left:5px solid #22c55e;background:linear-gradient(145deg,#123524,#10251c);}
-    .pivot-main {border-left:5px solid #38bdf8;background:linear-gradient(145deg,#172554,#0c4a6e);}
-    .pivot-cpr {border-left:5px solid #a78bfa;background:linear-gradient(145deg,#2e1065,#1e1b4b);}
-    @media (max-width:640px){.cal-day{min-height:46px;padding:4px}.cal-note{display:none}.market-calendar-grid{gap:3px}}
-
-    /* One final decision banner */
-    .final-one-buy-ce {background:linear-gradient(135deg,#14532d,#22c55e);color:white;border:2px solid #16a34a;}
-    .final-one-buy-pe {background:linear-gradient(135deg,#7f1d1d,#ef4444);color:white;border:2px solid #dc2626;}
-    .final-one-wait {background:linear-gradient(135deg,#92400e,#fbbf24);color:#3b2200;border:2px solid #d97706;}
-    .final-one-banner {padding:16px;border-radius:14px;text-align:center;font-size:clamp(1.15rem,1.8vw,1.7rem);font-weight:900;margin:.55rem 0;box-shadow:0 7px 20px rgba(15,23,42,.16);}
-
-    /* V31 full-width multi-timeframe panels */
-    .mtf-full-panel {width:100%;box-sizing:border-box;border-radius:14px;padding:14px 16px;margin:.55rem 0;box-shadow:0 7px 18px rgba(15,23,42,.14);border:1px solid rgba(148,163,184,.35);color:#f8fafc;}
-    .mtf-5m {background:linear-gradient(135deg,#0f172a,#1d4ed8);}
-    .mtf-15m {background:linear-gradient(135deg,#312e81,#7c3aed);}
-    .mtf-60m {background:linear-gradient(135deg,#064e3b,#059669);}
-    .mtf-full-title {font-size:1.05rem;font-weight:900;margin-bottom:.55rem;letter-spacing:.02em;}
-    .mtf-full-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.55rem;}
-    .mtf-full-item {background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);border-radius:10px;padding:.58rem .65rem;min-width:0;}
-    .mtf-full-label {font-size:.72rem;font-weight:750;opacity:.82;margin-bottom:.16rem;}
-    .mtf-full-value {font-size:clamp(.92rem,1.2vw,1.15rem);font-weight:900;overflow-wrap:anywhere;}
-    @media(max-width:760px){.mtf-full-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
-    @media(max-width:460px){.mtf-full-grid{grid-template-columns:1fr;}}
-
-    /* V25 guaranteed option-chain colours using native HTML table */
-    .option-html-wrap {width:100%;overflow:auto;max-height:650px;border:1px solid #475569;border-radius:12px;background:#0b1220;}
-    table.option-html {width:100%;border-collapse:separate;border-spacing:0;min-width:1250px;font-size:.78rem;color:#e5e7eb;}
-    table.option-html th {position:sticky;top:0;z-index:3;background:#111827;color:#f8fafc;padding:8px 7px;border-bottom:2px solid #475569;text-align:right;white-space:nowrap;}
-    table.option-html td {padding:7px;border-bottom:1px solid #263244;text-align:right;white-space:nowrap;background:#111827;}
-    table.option-html tr.level-atm td {background:#facc15!important;color:#1c1917!important;font-weight:900!important;border-top:2px solid #a16207;border-bottom:2px solid #a16207;}
-    table.option-html tr.level-resistance td {background:#dc2626!important;color:#fff!important;font-weight:900!important;border-top:2px solid #7f1d1d;border-bottom:2px solid #7f1d1d;}
-    table.option-html tr.level-support td {background:#16a34a!important;color:#fff!important;font-weight:900!important;border-top:2px solid #14532d;border-bottom:2px solid #14532d;}
-    table.option-html tr.level-atm-resistance td {background:linear-gradient(90deg,#dc2626 0 50%,#facc15 50% 100%)!important;color:#111827!important;font-weight:950!important;}
-    table.option-html tr.level-atm-support td {background:linear-gradient(90deg,#facc15 0 50%,#16a34a 50% 100%)!important;color:#111827!important;font-weight:950!important;}
-    table.option-html tr.level-support-resistance td {background:linear-gradient(90deg,#dc2626 0 50%,#16a34a 50% 100%)!important;color:#fff!important;font-weight:950!important;}
-    table.option-html tr.level-all td {background:linear-gradient(90deg,#dc2626 0 33%,#facc15 33% 66%,#16a34a 66% 100%)!important;color:#111827!important;font-weight:950!important;}
-    table.option-html td.strike-cell {font-size:.86rem;font-weight:950;text-align:center;border-left:2px solid #64748b;border-right:2px solid #64748b;}
-    table.option-html tr:hover td {filter:brightness(1.13);}
-
-    /* V27 Indian option-chain: CE resistance, PE support and ATM remain independently visible */
-    table.indian-chain-v27 td {background:#111827!important;color:#e5e7eb!important;}
-    table.indian-chain-v27 td.v27-ce-resistance {background:linear-gradient(135deg,#7f1d1d,#dc2626)!important;color:#fff!important;font-weight:950!important;border-top:2px solid #f87171!important;border-bottom:2px solid #f87171!important;}
-    table.indian-chain-v27 td.v27-pe-support {background:linear-gradient(135deg,#14532d,#16a34a)!important;color:#fff!important;font-weight:950!important;border-top:2px solid #4ade80!important;border-bottom:2px solid #4ade80!important;}
-    .key-level-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.65rem;margin:.45rem 0 .75rem;position:sticky;top:0;z-index:20;}
-    .key-level-card{border-radius:12px;padding:.72rem .85rem;display:flex;flex-direction:column;box-shadow:0 6px 16px rgba(0,0,0,.24);border:2px solid rgba(255,255,255,.32);font-weight:900;}
-    .key-level-card span{font-size:1.25rem;line-height:1.15;margin:.15rem 0;}
-    .key-level-card small{font-size:.72rem;font-weight:750;opacity:.92;}
-    .key-support{background:linear-gradient(135deg,#14532d,#22c55e);color:#fff;}
-    .key-atm{background:linear-gradient(135deg,#a16207,#facc15);color:#1c1917;}
-    .key-resistance{background:linear-gradient(135deg,#7f1d1d,#ef4444);color:#fff;}
-    table.indian-chain-v27 tbody tr.v27-sup-row td{background:rgba(22,163,74,.58)!important;color:#fff!important;font-weight:900!important;}
-    table.indian-chain-v27 tbody tr.v27-res-row td{background:rgba(220,38,38,.58)!important;color:#fff!important;font-weight:900!important;}
-    table.indian-chain-v27 tbody tr.v27-atm-row td{box-shadow:inset 0 2px #fde047,inset 0 -2px #fde047!important;}
-    @media(max-width:760px){.key-level-grid{grid-template-columns:1fr;position:relative;}}
-    table.indian-chain-v27 td.v27-support-outline {border-top:2px solid #22c55e!important;border-bottom:2px solid #22c55e!important;}
-    table.indian-chain-v27 td.v27-resistance-outline {border-top:2px solid #ef4444!important;border-bottom:2px solid #ef4444!important;}
-    table.indian-chain-v27 td.v27-atm-cell {background:#facc15!important;color:#111827!important;border:3px solid #fde047!important;}
-    table.indian-chain-v27 td.v27-res-strike {box-shadow:inset 5px 0 0 #ef4444!important;}
-    table.indian-chain-v27 td.v27-sup-strike {box-shadow:inset -5px 0 0 #22c55e!important;}
-    .strike-box {display:flex;align-items:center;justify-content:center;gap:5px;min-width:82px;}
-    .level-tag {display:inline-block;padding:2px 5px;margin-left:2px;border-radius:5px;font-size:.61rem;font-weight:950;line-height:1.1;}
-    .tag-atm {background:#facc15;color:#111827;border:1px solid #a16207;}
-    .tag-res {background:#dc2626;color:#fff;border:1px solid #fecaca;}
-    .tag-sup {background:#16a34a;color:#fff;border:1px solid #bbf7d0;}
-
-
-    /* =====================================================
-       V31.1 RESPONSIVE: MOBILE + TABLET + DESKTOP
-       ===================================================== */
-    * { box-sizing: border-box; }
-
-    /* Keep the app fluid on every screen size. */
-    [data-testid="stAppViewContainer"],
-    [data-testid="stMain"],
-    [data-testid="stMainBlockContainer"],
-    [data-testid="stAppViewBlockContainer"],
-    .block-container {
-        width: 100% !important;
-        max-width: 100% !important;
-    }
-
-    /* Desktop: spacious terminal layout. */
-    @media (min-width: 1200px) {
-        [data-testid="stAppViewBlockContainer"], .block-container {
-            padding-left: 1.15rem !important;
-            padding-right: 1.15rem !important;
-        }
-        [data-testid="column"] { flex-basis: 190px !important; }
-    }
-
-    /* Tablet: two-column cards where possible. */
-    @media (min-width: 641px) and (max-width: 1199px) {
-        [data-testid="stAppViewBlockContainer"], .block-container {
-            padding-left: .7rem !important;
-            padding-right: .7rem !important;
-        }
-        [data-testid="stHorizontalBlock"] {
-            gap: .55rem !important;
-        }
-        [data-testid="column"] {
-            flex: 1 1 calc(50% - .55rem) !important;
-            min-width: 220px !important;
-        }
-        .color-card-grid,
-        .pivot-grid { grid-template-columns: repeat(2, minmax(0,1fr)) !important; }
-    }
-
-    /* Mobile: one clean full-width column with touch-friendly controls. */
-    @media (max-width: 640px) {
-        [data-testid="stAppViewBlockContainer"], .block-container {
-            padding-top: 1.1rem !important;
-            padding-left: .48rem !important;
-            padding-right: .48rem !important;
-            padding-bottom: 1.2rem !important;
-        }
-        [data-testid="stHorizontalBlock"] {
-            display: flex !important;
-            flex-direction: column !important;
-            gap: .42rem !important;
-        }
-        [data-testid="column"] {
-            width: 100% !important;
-            max-width: 100% !important;
-            min-width: 0 !important;
-            flex: 1 1 100% !important;
-        }
-        .terminal-header {
-            grid-template-columns: 1fr !important;
-            min-height: auto !important;
-            padding: .82rem !important;
-            margin-top: .25rem !important;
-            border-radius: 12px !important;
-        }
-        .terminal-header-title { font-size: 1.38rem !important; }
-        .terminal-header-subtitle { font-size: .76rem !important; }
-        .vix-badge {
-            width: 100% !important;
-            min-width: 0 !important;
-            min-height: 70px !important;
-        }
-        .terminal-strip,
-        .live-grid,
-        .color-card-grid,
-        .pivot-grid,
-        .key-level-grid { grid-template-columns: 1fr !important; }
-        .mtf-full-panel { padding: 11px !important; }
-        .mtf-full-grid { grid-template-columns: repeat(2,minmax(0,1fr)) !important; }
-        .market-calendar-wrap { padding: 9px !important; }
-        .market-calendar-grid { gap: 2px !important; }
-        .cal-day { min-height: 42px !important; padding: 3px !important; }
-        .cal-number { font-size: .72rem !important; }
-        .cal-note { display: none !important; }
-        div[data-testid="stMetric"] {
-            min-height: 66px !important;
-            padding: .52rem .62rem !important;
-        }
-        div[data-testid="stMetricValue"] { font-size: 1.08rem !important; }
-        .stButton > button,
-        [data-testid="stDownloadButton"] button {
-            width: 100% !important;
-            min-height: 44px !important;
-        }
-        [data-testid="stSelectbox"],
-        [data-testid="stNumberInput"],
-        [data-testid="stTextInput"] { width: 100% !important; }
-        .final-one-banner { padding: 12px 9px !important; }
-        h1 { font-size: 1.55rem !important; }
-        h2 { font-size: 1.28rem !important; }
-        h3 { font-size: 1.08rem !important; }
-    }
-
-    @media (max-width: 420px) {
-        .mtf-full-grid { grid-template-columns: 1fr !important; }
-        .terminal-header-title { font-size: 1.24rem !important; }
-        .option-html-wrap { max-height: 520px !important; }
-    }
-
-    /* Option chain stays readable: swipe horizontally on phone/tablet. */
-    .option-html-wrap {
-        -webkit-overflow-scrolling: touch !important;
-        overscroll-behavior-x: contain;
-        scrollbar-width: thin;
-    }
-    table.option-html th:first-child,
-    table.option-html td:first-child {
-        position: sticky;
-        left: 0;
-        z-index: 2;
-    }
-    table.option-html th:first-child { z-index: 5; }
-
-    /* Plotly charts and dataframes must never overflow the device. */
-    [data-testid="stPlotlyChart"],
-    [data-testid="stDataFrame"],
-    [data-testid="stTable"],
-    .js-plotly-plot, .plot-container, .svg-container {
-        width: 100% !important;
-        max-width: 100% !important;
-    }
-    </style>
-    """,
+<style>
+:root {
+    --bg-1:#041124;
+    --bg-2:#071d3d;
+    --panel:#0b2a55;
+    --panel-2:#0a2144;
+    --line:rgba(151,199,255,.23);
+    --text:#f7fbff;
+    --muted:#abc9ec;
+    --green:#2ee6a6;
+    --red:#ff667c;
+    --amber:#ffd166;
+    --cyan:#47c9ff;
+}
+html, body, [data-testid="stAppViewContainer"] {
+    background:
+      radial-gradient(circle at 14% 12%, rgba(26,120,255,.18), transparent 29%),
+      radial-gradient(circle at 86% 5%, rgba(0,218,177,.12), transparent 25%),
+      linear-gradient(135deg,var(--bg-1),var(--bg-2) 52%,#06162d);
+    color:var(--text);
+}
+[data-testid="stHeader"] {background:transparent;}
+[data-testid="stToolbar"] {right:1rem;}
+[data-testid="stSidebar"] {
+    background:linear-gradient(180deg,#06152c,#081e3c 56%,#06152c);
+    border-right:1px solid var(--line);
+}
+.block-container {
+    max-width:1600px;
+    padding-top:.7rem !important;
+    padding-bottom:2.5rem;
+}
+.hero {
+    width:100%;
+    text-align:center;
+    padding:8px 10px 5px;
+    margin:0 auto 10px;
+}
+.hero-title {
+    margin:0;
+    font-size:clamp(30px,4vw,52px);
+    line-height:1.15;
+    font-weight:900;
+    letter-spacing:-1.2px;
+    color:white;
+    text-shadow:0 8px 28px rgba(0,0,0,.40);
+}
+.hero-sub {
+    color:#b8d8ff;
+    font-size:14px;
+    margin-top:7px;
+}
+.status-strip {
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    align-items:center;
+    justify-content:center;
+    margin:4px 0 14px;
+}
+.status-pill {
+    padding:7px 12px;
+    border-radius:999px;
+    background:rgba(255,255,255,.07);
+    border:1px solid var(--line);
+    color:#dcecff;
+    font-size:12px;
+}
+.metric-card {
+    min-height:136px;
+    border-radius:18px;
+    padding:18px;
+    border:1px solid var(--line);
+    background:linear-gradient(145deg,rgba(18,76,145,.72),rgba(7,31,67,.90));
+    box-shadow:0 14px 34px rgba(0,0,0,.23);
+    overflow:hidden;
+}
+.metric-card .label {
+    color:#b8d5f7;
+    font-size:13px;
+    font-weight:650;
+    margin-bottom:10px;
+}
+.metric-card .value {
+    color:white;
+    font-size:25px;
+    font-weight:900;
+    line-height:1.15;
+}
+.metric-card .sub {
+    color:#b9cce5;
+    font-size:12px;
+    margin-top:11px;
+}
+.decision-card {
+    border-radius:20px;
+    padding:22px;
+    border:1px solid rgba(255,209,102,.55);
+    background:linear-gradient(135deg,rgba(121,83,16,.66),rgba(28,34,47,.92));
+    box-shadow:0 16px 38px rgba(0,0,0,.28);
+}
+.decision-card.buy {
+    border-color:rgba(46,230,166,.68);
+    background:linear-gradient(135deg,rgba(8,101,72,.72),rgba(16,42,49,.94));
+}
+.decision-card.sell {
+    border-color:rgba(255,102,124,.68);
+    background:linear-gradient(135deg,rgba(121,27,47,.76),rgba(43,23,34,.94));
+}
+.decision-label {color:#cbdaf0;font-size:13px;}
+.decision-value {font-size:30px;font-weight:950;margin-top:5px;}
+.decision-note {color:#d3dfef;font-size:13px;margin-top:8px;}
+.section-title {
+    font-size:24px;
+    font-weight:900;
+    margin:18px 0 10px;
+}
+.note-box {
+    border:1px solid var(--line);
+    background:rgba(255,255,255,.055);
+    padding:12px 14px;
+    border-radius:13px;
+    color:#c6d7ed;
+    font-size:13px;
+}
+.good {color:var(--green)!important;}
+.bad {color:var(--red)!important;}
+.warn {color:var(--amber)!important;}
+.cyan {color:var(--cyan)!important;}
+div[data-testid="stDataFrame"] {
+    border:1px solid var(--line);
+    border-radius:14px;
+    overflow:hidden;
+}
+.stButton > button {
+    width:100%;
+    border-radius:11px;
+    font-weight:800;
+    min-height:42px;
+}
+div[data-baseweb="select"] > div,
+.stTextInput input,
+.stTextArea textarea,
+.stNumberInput input {
+    border-radius:11px !important;
+}
+[data-testid="stMetricValue"] {color:#fff;}
+
+.price-pulse {
+    animation: pricePulse 1.4s ease-in-out infinite;
+}
+@keyframes pricePulse {
+    0%,100% {opacity:1;}
+    50% {opacity:.66;}
+}
+.trade-plan {
+    border:1px solid rgba(71,201,255,.35);
+    background:linear-gradient(145deg,rgba(9,54,102,.86),rgba(6,27,57,.94));
+    border-radius:18px;
+    padding:18px;
+    box-shadow:0 12px 32px rgba(0,0,0,.23);
+}
+.trade-plan .big {font-size:25px;font-weight:900;color:#fff;}
+.trade-plan .small {font-size:12px;color:#b9cee8;margin-top:7px;}
+@media (max-width: 760px) {
+    .block-container {padding-left:.55rem!important;padding-right:.55rem!important;padding-top:.25rem!important;}
+    .hero-title {font-size:29px!important;letter-spacing:-.5px;}
+    .hero-sub {font-size:11px;}
+    .status-strip {justify-content:flex-start;gap:5px;}
+    .status-pill {padding:5px 8px;font-size:10px;}
+    .metric-card {min-height:112px;padding:13px;border-radius:14px;}
+    .metric-card .value {font-size:20px;}
+    .decision-card {padding:15px;}
+    .decision-value {font-size:22px;}
+    .section-title {font-size:20px;}
+}
+
+.level-grid {
+    display:grid;
+    grid-template-columns:repeat(5,minmax(0,1fr));
+    gap:14px;
+    margin:8px 0 20px;
+}
+.level-card {
+    position:relative;
+    min-height:118px;
+    border-radius:18px;
+    padding:17px;
+    overflow:hidden;
+    border:1px solid rgba(255,255,255,.14);
+    box-shadow:0 14px 32px rgba(0,0,0,.24);
+    transition:transform .18s ease, box-shadow .18s ease;
+}
+.level-card:hover {
+    transform:translateY(-3px);
+    box-shadow:0 18px 40px rgba(0,0,0,.32);
+}
+.level-card::after {
+    content:"";
+    position:absolute;
+    width:95px;
+    height:95px;
+    right:-28px;
+    top:-28px;
+    border-radius:50%;
+    background:rgba(255,255,255,.10);
+}
+.level-icon {
+    font-size:22px;
+    margin-bottom:8px;
+}
+.level-label {
+    font-size:12px;
+    color:rgba(255,255,255,.78);
+    font-weight:700;
+    letter-spacing:.2px;
+}
+.level-value {
+    position:relative;
+    z-index:2;
+    font-size:27px;
+    line-height:1.15;
+    color:white;
+    font-weight:950;
+    margin-top:6px;
+}
+.level-sub {
+    position:relative;
+    z-index:2;
+    font-size:11px;
+    color:rgba(255,255,255,.76);
+    margin-top:8px;
+}
+.spot-card {
+    background:linear-gradient(145deg,#087f5b,#0fbf85 54%,#075f45);
+}
+.atm-card {
+    background:linear-gradient(145deg,#9a6500,#e4a900 54%,#805300);
+}
+.support-card {
+    background:linear-gradient(145deg,#0759a8,#0b93e7 54%,#063e75);
+}
+.resistance-card {
+    background:linear-gradient(145deg,#a51f3c,#ef4964 54%,#71142b);
+}
+.maxpain-card {
+    background:linear-gradient(145deg,#6637a3,#9b63e6 54%,#472376);
+}
+.pivot-grid {
+    display:grid;
+    grid-template-columns:repeat(7,minmax(0,1fr));
+    gap:11px;
+    margin:8px 0 20px;
+}
+.pivot-card {
+    border-radius:15px;
+    padding:14px 12px;
+    min-height:104px;
+    border:1px solid rgba(255,255,255,.13);
+    box-shadow:0 10px 24px rgba(0,0,0,.20);
+}
+.pivot-label {
+    font-size:11px;
+    color:rgba(255,255,255,.78);
+    font-weight:750;
+}
+.pivot-value {
+    font-size:20px;
+    color:white;
+    font-weight:900;
+    margin-top:7px;
+}
+.pivot-main {
+    background:linear-gradient(145deg,#9d6b00,#e5ae17);
+}
+.pivot-high {
+    background:linear-gradient(145deg,#0855a0,#1296dc);
+}
+.pivot-low {
+    background:linear-gradient(145deg,#b95d00,#f29426);
+}
+.pivot-close {
+    background:linear-gradient(145deg,#4b5f77,#7d92ab);
+}
+.support-level {
+    background:linear-gradient(145deg,#7c1731,#c12f4c);
+}
+.resistance-level {
+    background:linear-gradient(145deg,#07663f,#14a768);
+}
+.liquidity-panel {
+    border-radius:20px;
+    padding:18px;
+    border:1px solid rgba(46,230,166,.40);
+    background:linear-gradient(145deg,rgba(7,99,70,.75),rgba(5,43,55,.94));
+    box-shadow:0 14px 32px rgba(0,0,0,.24);
+    margin-top:8px;
+}
+.liquidity-grid {
+    display:grid;
+    grid-template-columns:repeat(4,minmax(0,1fr));
+    gap:12px;
+}
+.liquidity-item {
+    background:rgba(255,255,255,.07);
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:14px;
+    padding:13px;
+}
+.liquidity-label {
+    font-size:11px;
+    color:#bfe7d8;
+}
+.liquidity-value {
+    font-size:22px;
+    font-weight:900;
+    color:white;
+    margin-top:6px;
+}
+@media (max-width: 1000px) {
+    .level-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
+    .pivot-grid {grid-template-columns:repeat(3,minmax(0,1fr));}
+}
+@media (max-width: 650px) {
+    .level-grid {grid-template-columns:1fr 1fr;gap:8px;}
+    .level-card {min-height:102px;padding:13px;}
+    .level-value {font-size:21px;}
+    .pivot-grid {grid-template-columns:1fr 1fr;gap:8px;}
+    .pivot-value {font-size:18px;}
+    .liquidity-grid {grid-template-columns:1fr 1fr;}
+}
+
+.signal-grid {
+    display:grid;
+    grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:13px;
+    margin:9px 0 17px;
+}
+.signal-card {
+    min-height:125px;
+    border-radius:18px;
+    padding:16px;
+    border:1px solid rgba(255,255,255,.15);
+    box-shadow:0 13px 30px rgba(0,0,0,.22);
+    position:relative;
+    overflow:hidden;
+}
+.signal-card::after {
+    content:"";
+    width:90px;
+    height:90px;
+    border-radius:50%;
+    position:absolute;
+    right:-24px;
+    top:-28px;
+    background:rgba(255,255,255,.09);
+}
+.signal-name {font-size:12px;color:rgba(255,255,255,.78);font-weight:750;}
+.signal-reading {font-size:23px;color:white;font-weight:950;margin-top:8px;}
+.signal-use {font-size:11px;color:rgba(255,255,255,.77);margin-top:8px;}
+.signal-score {
+    height:7px;border-radius:99px;background:rgba(0,0,0,.23);
+    margin-top:10px;overflow:hidden;
+}
+.signal-score > span {
+    display:block;height:100%;border-radius:99px;
+    background:rgba(255,255,255,.83);
+}
+.signal-bull {background:linear-gradient(145deg,#087a52,#11b97a);}
+.signal-bear {background:linear-gradient(145deg,#92213a,#e34a61);}
+.signal-blue {background:linear-gradient(145deg,#075598,#0b9ddd);}
+.signal-purple {background:linear-gradient(145deg,#5b3292,#9561dc);}
+.signal-gold {background:linear-gradient(145deg,#926000,#dba500);}
+.signal-orange {background:linear-gradient(145deg,#a84e00,#eb841e);}
+.index-strip {
+    display:grid;
+    grid-template-columns:repeat(6,minmax(0,1fr));
+    gap:8px;
+    margin:5px 0 14px;
+}
+.index-chip {
+    border:1px solid rgba(151,199,255,.22);
+    background:rgba(255,255,255,.055);
+    border-radius:12px;
+    padding:9px 8px;
+    text-align:center;
+    color:#cce4ff;
+    font-size:11px;
+    font-weight:750;
+}
+@media(max-width:900px){
+    .signal-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+    .index-strip{grid-template-columns:repeat(3,minmax(0,1fr));}
+}
+@media(max-width:600px){
+    .signal-grid{grid-template-columns:1fr 1fr;gap:8px;}
+    .signal-card{min-height:112px;padding:12px;}
+    .signal-reading{font-size:19px;}
+    .index-strip{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+
+/* V10.3 terminal-style additions */
+[data-testid="stAppViewContainer"] .block-container {max-width:1900px;padding-left:.7rem!important;padding-right:.7rem!important;}
+.pro-summary {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:8px 0 12px;}
+.pro-card {background:linear-gradient(145deg,#071827,#0a2236);border:1px solid #173b55;border-radius:12px;padding:13px;min-height:108px;box-shadow:0 10px 28px rgba(0,0,0,.28);}
+.pro-card .k {font-size:11px;color:#8db4d4;font-weight:800;text-transform:uppercase;}
+.pro-card .v {font-size:24px;font-weight:950;color:#fff;margin-top:9px;}
+.pro-card .s {font-size:11px;color:#a9c2d8;margin-top:7px;}
+.pro-green .v{color:#35e67d}.pro-red .v{color:#ff5b70}.pro-amber .v{color:#ffd166}.pro-cyan .v{color:#46c9ff}
+.level-strip2 {display:grid;grid-template-columns:repeat(7,minmax(0,1fr));background:#071523;border:1px solid #173b55;border-radius:12px;overflow:hidden;margin:8px 0 14px;}
+.level2 {padding:11px 10px;text-align:center;border-right:1px solid #173b55}.level2:last-child{border-right:none}.level2 .k{font-size:10px;color:#91abc1;font-weight:800}.level2 .v{font-size:18px;font-weight:950;margin-top:5px}.lv-s .v{color:#35e67d}.lv-r .v{color:#ff5b70}.lv-p .v{color:#ffd166}.lv-x .v{color:#46c9ff}
+.trade-strip {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:9px;margin:8px 0 14px;}
+.trade-mini {background:#071827;border:1px solid #173b55;border-radius:10px;padding:10px;text-align:center}.trade-mini .k{font-size:10px;color:#8ba9c0}.trade-mini .v{font-size:18px;font-weight:950;color:white;margin-top:5px}.trade-entry .v{color:#46c9ff}.trade-sl .v{color:#ff5b70}.trade-target .v{color:#35e67d}
+.option-title {display:flex;justify-content:space-between;gap:10px;align-items:center;background:#071523;border:1px solid #173b55;border-radius:10px;padding:10px 13px;margin-top:6px}.option-title b{color:#46c9ff;font-size:18px}.option-title span{color:#91abc1;font-size:11px}
+@media(max-width:1100px){.pro-summary{grid-template-columns:repeat(3,1fr)}.level-strip2{grid-template-columns:repeat(4,1fr)}.trade-strip{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:650px){.pro-summary{grid-template-columns:repeat(2,1fr)}.pro-card{min-height:92px;padding:10px}.pro-card .v{font-size:19px}.level-strip2{grid-template-columns:repeat(2,1fr)}.trade-strip{grid-template-columns:repeat(2,1fr)}}
+
+footer {visibility:hidden;}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------
+# DATA STRUCTURES
+# ---------------------------------------------------------------------
+@dataclass
+class ApiResult:
+    ok: bool
+    data: Any = None
+    message: str = ""
+    status_code: int | None = None
+    elapsed_ms: int | None = None
 
-# =========================================================
-# CREDENTIALS
-# =========================================================
-# Recommended:
-# 1) Put credentials in environment variables:
-#    DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN
-# OR
-# 2) Create .streamlit/secrets.toml:
-#    DHAN_CLIENT_ID = "..."
-#    DHAN_ACCESS_TOKEN = "..."
-# Fallback placeholders are kept for easy setup.
 
-def get_secret(name, fallback):
+# ---------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return st.secrets.get(name, os.getenv(name, fallback))
-    except Exception:
-        return os.getenv(name, fallback)
-
-
-CLIENT_ID = str(get_secret("DHAN_CLIENT_ID", "")).strip()
-ACCESS_TOKEN = str(get_secret("DHAN_ACCESS_TOKEN", "")).strip()
-
-CREDENTIALS_READY = (
-    CLIENT_ID not in {"", "YOUR_CLIENT_ID"}
-    and ACCESS_TOKEN not in {"", "YOUR_ACCESS_TOKEN"}
-)
-
-HEADERS = {
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "access-token": ACCESS_TOKEN,
-    "client-id": CLIENT_ID,
-}
-
-dhan = dhanhq(DhanContext(CLIENT_ID, ACCESS_TOKEN)) if CREDENTIALS_READY else None
-
-
-# =========================================================
-# SESSION STATE
-# =========================================================
-
-DEFAULT_STATE = {
-    "load_chain": False,
-    "last_signal": "",
-    "signal_log": [],
-    "last_error": "",
-    "paper_balance": 100000.0,
-    "paper_positions": [],
-    "paper_trades": [],
-    "paper_order_message": "",
-    "api_logs": [],
-    "last_market_quotes": {},
-    "commodity_chain_load": False,
-    "commodity_choice": "GOLD",
-}
-
-for key, value in DEFAULT_STATE.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-
-# =========================================================
-# GENERAL HELPERS
-# =========================================================
-
-IST = ZoneInfo("Asia/Kolkata")
-
-
-def safe_float(value, default=0.0):
-    try:
-        number = float(value if value is not None else default)
-        if not math.isfinite(number):
+        if value is None or value == "":
             return default
-        return number
+        result = float(value)
+        return result if math.isfinite(result) else default
     except (TypeError, ValueError):
         return default
 
 
-def safe_int(value, default=0):
+def fmt_num(value: Any, decimals: int = 2, fallback: str = "—") -> str:
     try:
-        return int(value if value is not None else default)
+        x = float(value)
+        if not math.isfinite(x):
+            return fallback
+        return f"{x:,.{decimals}f}"
     except (TypeError, ValueError):
+        return fallback
+
+
+def compact_num(value: Any) -> str:
+    x = safe_float(value)
+    ax = abs(x)
+    if ax >= 10_000_000:
+        return f"{x/10_000_000:.2f}Cr"
+    if ax >= 100_000:
+        return f"{x/100_000:.2f}L"
+    if ax >= 1_000:
+        return f"{x/1_000:.1f}K"
+    return f"{x:.0f}"
+
+
+def now_ist_text() -> str:
+    return datetime.now().strftime("%d %b %Y, %I:%M:%S %p")
+
+
+def is_market_open() -> tuple[bool, str]:
+    now = datetime.now()
+    weekday = now.weekday() < 5
+    session = time(9, 15) <= now.time() <= time(15, 30)
+    if weekday and session:
+        return True, "Market Open"
+    return False, "Market Closed"
+
+
+
+def read_secret(name: str, default: str = "") -> str:
+    """Read Streamlit Cloud secrets safely; returns default when unavailable."""
+    try:
+        value = st.secrets.get(name, default)
+        return str(value) if value is not None else default
+    except Exception:
         return default
 
 
-def render_html(html):
-    """Render HTML without Markdown turning indented tags into code blocks."""
-    cleaned = textwrap.dedent(str(html)).strip()
-    cleaned = "".join(line.strip() for line in cleaned.splitlines())
-    cleaned = re.sub(r">\s+<", "><", cleaned)
-    st.markdown(cleaned, unsafe_allow_html=True)
+def classify_api_error(result: ApiResult) -> str:
+    message = str(result.message or "")
+    raw = f"{message} {result.data}".upper()
+    if any(code in raw for code in ("807", "TOKEN EXPIRED", "EXPIRED TOKEN")):
+        return "TOKEN_EXPIRED"
+    if any(code in raw for code in ("808", "809", "810", "UNAUTHORIZED", "AUTHENTICATION")):
+        return "AUTH_ERROR"
+    if "806" in raw or "DATA API" in raw and "SUBSCR" in raw:
+        return "DATA_SUBSCRIPTION"
+    if "DH-904" in raw or "TOO MANY REQUEST" in raw or result.status_code == 429:
+        return "RATE_LIMIT"
+    return "OTHER"
 
 
-def render_colored_option_table(frame, atm, resistance, support, height=820):
-    """Render permanently visible key levels plus a strongly coloured option chain."""
-    if frame is None or frame.empty:
-        st.warning("No option-chain rows available.")
-        return
 
-    display = frame.copy()
+def normalize_col(name: Any) -> str:
+    return str(name).strip().upper().replace(" ", "_")
 
-    def level_row(level):
-        if not level:
-            return None
-        matches = display[(display["Strike"] - float(level)).abs() < 0.001]
-        return matches.iloc[0] if not matches.empty else None
 
-    support_row = level_row(support)
-    atm_row = level_row(atm)
-    resistance_row = level_row(resistance)
+@st.cache_data(ttl=43200, show_spinner=False)
+def fetch_instrument_master() -> pd.DataFrame:
+    """Load Dhan's official compact instrument master and normalize its columns."""
+    try:
+        df = pd.read_csv(DHAN_INSTRUMENT_MASTER, low_memory=False)
+        df.columns = [normalize_col(c) for c in df.columns]
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-    def key_card(label, level, row, css_class, side):
-        if row is None:
-            return f'<div class="key-level-card {css_class}"><b>{label}</b><span>₹ {level:,.0f}</span></div>'
-        oi_col = "PE OI" if side == "PE" else "CE OI"
-        ltp_col = "PE LTP" if side == "PE" else "CE LTP"
-        return (
-            f'<div class="key-level-card {css_class}">'
-            f'<b>{label}</b><span>₹ {level:,.0f}</span>'
-            f'<small>{side} OI: {safe_float(row.get(oi_col)):,.0f} · LTP: ₹ {safe_float(row.get(ltp_col)):,.2f}</small>'
-            f'</div>'
-        )
 
-    pinned = (
-        '<div class="key-level-grid">'
-        + key_card("🟩 SUPPORT S1", support, support_row, "key-support", "PE")
-        + key_card("🟨 ATM", atm, atm_row, "key-atm", "CE")
-        + key_card("🟥 RESISTANCE R1", resistance, resistance_row, "key-resistance", "CE")
-        + '</div>'
+def first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for name in candidates:
+        if name in df.columns:
+            return name
+    return None
+
+
+def discover_indices(master: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """Resolve current index Security IDs instead of relying on stale hard-coded IDs."""
+    discovered: dict[str, dict[str, Any]] = {}
+    if master.empty:
+        return discovered
+
+    security_col = first_existing(
+        master,
+        ["SEM_SMST_SECURITY_ID", "SECURITY_ID", "SM_SECURITY_ID"],
     )
-    st.markdown(pinned, unsafe_allow_html=True)
-    columns = list(display.columns)
-    strike_pos = columns.index("Strike") if "Strike" in columns else -1
-    numeric_formats = {
-        "CE IV": "{:.2f}", "CE Delta": "{:.3f}", "CE Gamma": "{:.5f}",
-        "CE Theta": "{:.2f}", "CE Vega": "{:.2f}", "CE LTP": "{:.2f}",
-        "Strike": "{:.0f}", "PE LTP": "{:.2f}", "PE Delta": "{:.3f}",
-        "PE Gamma": "{:.5f}", "PE Theta": "{:.2f}", "PE Vega": "{:.2f}",
-        "PE IV": "{:.2f}",
-    }
+    symbol_col = first_existing(
+        master,
+        [
+            "SEM_CUSTOM_SYMBOL",
+            "SEM_TRADING_SYMBOL",
+            "DISPLAY_NAME",
+            "SYMBOL_NAME",
+            "SYMBOL",
+        ],
+    )
+    instrument_col = first_existing(
+        master,
+        ["SEM_INSTRUMENT_NAME", "INSTRUMENT", "INSTRUMENT_TYPE"],
+    )
+    exchange_col = first_existing(
+        master,
+        ["SEM_EXM_EXCH_ID", "EXCHANGE", "EXCHANGE_ID"],
+    )
 
-    def same_level(value, level):
-        return math.isclose(safe_float(value), safe_float(level), rel_tol=0, abs_tol=0.001)
+    if not security_col or not symbol_col:
+        return discovered
 
-    parts = [
-        f'<div class="option-html-wrap" style="max-height:{int(height)}px">',
-        '<table class="option-html indian-chain-v27"><thead><tr>'
-    ]
-    parts.extend(f'<th>{col}</th>' for col in columns)
-    parts.append('</tr></thead><tbody>')
+    work = master.copy()
+    work["_SEARCH"] = work[symbol_col].fillna("").astype(str).str.upper().str.strip()
+    if instrument_col:
+        instrument_text = work[instrument_col].fillna("").astype(str).str.upper()
+        index_rows = work[instrument_text.str.contains("INDEX", na=False)]
+        if not index_rows.empty:
+            work = index_rows
 
-    for _, row in display.iterrows():
-        strike = safe_float(row.get("Strike"))
-        is_atm = same_level(strike, atm)
-        is_res = same_level(strike, resistance)
-        is_sup = same_level(strike, support)
-        row_classes = []
-        if is_atm: row_classes.append("v27-atm-row")
-        if is_res: row_classes.append("v27-res-row")
-        if is_sup: row_classes.append("v27-sup-row")
-        if is_res and is_atm:
-            row_style = "background:linear-gradient(90deg,rgba(220,38,38,.72),rgba(250,204,21,.78))!important;"
-        elif is_sup and is_atm:
-            row_style = "background:linear-gradient(90deg,rgba(34,197,94,.72),rgba(250,204,21,.78))!important;"
-        elif is_res:
-            row_style = "background:rgba(220,38,38,.58)!important;box-shadow:inset 0 2px #f87171,inset 0 -2px #f87171;"
-        elif is_sup:
-            row_style = "background:rgba(22,163,74,.58)!important;box-shadow:inset 0 2px #4ade80,inset 0 -2px #4ade80;"
-        elif is_atm:
-            row_style = "background:rgba(250,204,21,.72)!important;box-shadow:inset 0 2px #fde047,inset 0 -2px #fde047;"
-        else:
-            row_style = ""
-        parts.append(f'<tr class="{" ".join(row_classes)}" style="{row_style}">')
-
-        for index, col in enumerate(columns):
-            value = row[col]
-            if pd.isna(value):
-                text = ""
-            elif col in numeric_formats:
-                try:
-                    text = numeric_formats[col].format(float(value))
-                except Exception:
-                    text = str(value)
-            elif isinstance(value, (int, float)):
-                text = f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
-            else:
-                text = str(value)
-
-            classes = []
-            if col == "Strike":
-                classes.append("strike-cell")
-                if is_atm: classes.append("v27-atm-cell")
-                if is_res: classes.append("v27-res-strike")
-                if is_sup: classes.append("v27-sup-strike")
-                labels = []
-                if is_atm: labels.append('<span class="level-tag tag-atm">ATM</span>')
-                if is_res: labels.append('<span class="level-tag tag-res">R</span>')
-                if is_sup: labels.append('<span class="level-tag tag-sup">S</span>')
-                text = f'<div class="strike-box"><b>{text}</b><div>{"".join(labels)}</div></div>'
-            elif strike_pos >= 0 and index < strike_pos and is_res:
-                classes.append("v27-ce-resistance")
-            elif strike_pos >= 0 and index > strike_pos and is_sup:
-                classes.append("v27-pe-support")
-
-            # A subtle marker on the opposite half keeps the full level traceable.
-            if strike_pos >= 0 and index < strike_pos and is_sup:
-                classes.append("v27-support-outline")
-            if strike_pos >= 0 and index > strike_pos and is_res:
-                classes.append("v27-resistance-outline")
-
-            class_attr = f' class="{" ".join(classes)}"' if classes else ""
-            parts.append(f'<td{class_attr}>{text}</td>')
-        parts.append('</tr>')
-
-    parts.append('</tbody></table></div>')
-    st.markdown(''.join(parts), unsafe_allow_html=True)
-
-
-def request_with_retry(
-    method,
-    url,
-    *,
-    headers=None,
-    json=None,
-    timeout=25,
-    attempts=3,
-    pause_seconds=2,
-):
-    last_error = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                json=json,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            return response
-        except (
-            requests.ConnectionError,
-            requests.Timeout,
-            requests.HTTPError,
-        ) as error:
-            last_error = error
-
-            if attempt < attempts:
-                time.sleep(pause_seconds * attempt)
-
-    raise last_error
-
-
-
-def add_api_log(message, level="INFO"):
-    timestamp = datetime.now(IST).strftime("%H:%M:%S")
-    entry = {
-        "Time": timestamp,
-        "Level": str(level).upper(),
-        "Message": str(message),
-    }
-
-    logs = st.session_state.get("api_logs", [])
-    logs.append(entry)
-    st.session_state.api_logs = logs[-100:]
-
-
-def parse_marketfeed_payload(payload):
-    """
-    Accept official direct-REST responses and older SDK-wrapped responses.
-
-    Official v2:
-        {"status":"success", "data":{"IDX_I":{"13":{"last_price":...}}}}
-
-    Some older SDK versions wrap data once more:
-        {"status":"success", "data":{"data":{"IDX_I":{...}}}}
-    """
-    if not isinstance(payload, dict):
-        return {}, "Response is not a dictionary."
-
-    status = str(payload.get("status", "")).lower()
-
-    if status and status != "success":
-        return {}, format_api_error(payload)
-
-    data = payload.get("data", {})
-
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        data = data["data"]
-
-    if not isinstance(data, dict):
-        return {}, "Market-feed data section is missing."
-
-    parsed = {}
-
-    for segment, instruments in data.items():
-        if not isinstance(instruments, dict):
+    for display_name, aliases in TARGET_INDEX_ALIASES.items():
+        chosen = pd.DataFrame()
+        for alias in aliases:
+            exact = work[work["_SEARCH"] == alias.upper()]
+            if not exact.empty:
+                chosen = exact
+                break
+        if chosen.empty:
+            for alias in aliases:
+                contains = work[work["_SEARCH"].str.contains(alias.upper(), regex=False, na=False)]
+                if not contains.empty:
+                    chosen = contains
+                    break
+        if chosen.empty:
             continue
 
-        for security_id, values in instruments.items():
-            if not isinstance(values, dict):
-                continue
-
-            last_price = safe_float(
-                values.get(
-                    "last_price",
-                    values.get("lastPrice", values.get("ltp")),
-                )
-            )
-
-            if last_price <= 0:
-                continue
-
-            parsed[(str(segment), str(security_id))] = {
-                "last_price": last_price,
-                "raw": values,
+        row = chosen.iloc[0]
+        security_id = int(safe_float(row.get(security_col), 0))
+        exchange = str(row.get(exchange_col, "NSE")).upper() if exchange_col else "NSE"
+        # Dhan v2 uses IDX_I for index values, including BSE index underlyings.
+        # BSE_FNO is for derivative contracts, not the underlying index value.
+        segment = "IDX_I"
+        if security_id > 0:
+            discovered[display_name] = {
+                "security_id": security_id,
+                "segment": segment,
+                "chart_segment": segment,
+                "instrument": "INDEX",
+                "master_symbol": str(row.get(symbol_col, display_name)),
             }
-
-    if not parsed:
-        return {}, "No valid prices were found in the market-feed response."
-
-    return parsed, ""
+    return discovered
 
 
-def direct_marketfeed_ltp(payload, attempts=3):
-    url = "https://api.dhan.co/v2/marketfeed/ltp"
-
-    last_message = ""
-
-    for attempt in range(1, attempts + 1):
-        try:
-            response = requests.post(
-                url,
-                headers=HEADERS,
-                json=payload,
-                timeout=15,
-            )
-
-            try:
-                body = response.json()
-            except ValueError:
-                body = {
-                    "status": "failure",
-                    "remarks": f"Non-JSON HTTP {response.status_code}",
-                }
-
-            if response.ok:
-                parsed, parse_error = parse_marketfeed_payload(body)
-
-                if parsed:
-                    add_api_log(
-                        f"Market LTP success on attempt {attempt}: {payload}"
-                    )
-                    return parsed, ""
-
-                last_message = parse_error or format_api_error(body)
-            else:
-                last_message = (
-                    f"HTTP {response.status_code}: {format_api_error(body)}"
-                )
-
-        except (requests.Timeout, requests.ConnectionError) as error:
-            last_message = str(error)
-
-        except Exception as error:
-            last_message = str(error)
-
-        add_api_log(
-            f"Market LTP attempt {attempt} failed: {last_message}",
-            "WARNING",
-        )
-
-        if attempt < attempts:
-            time.sleep(attempt)
-
-    return {}, last_message or "Market-feed request failed."
+def signal_card_html(
+    name: str,
+    reading: str,
+    use: str,
+    score: float,
+    css_class: str,
+) -> str:
+    width = max(0, min(100, safe_float(score, 0)))
+    return f"""
+<div class="signal-card {css_class}">
+  <div class="signal-name">{name}</div>
+  <div class="signal-reading">{reading}</div>
+  <div class="signal-use">{use}</div>
+  <div class="signal-score"><span style="width:{width:.0f}%"></span></div>
+</div>
+"""
 
 
-def fetch_professional_index_quotes():
-    """
-    Fetch each index independently.
-
-    An unavailable BSE/NSE index can no longer break every other live card.
-    Only genuine live values are returned—no dummy fallback prices.
-    """
-    instruments = [
-        {"name": "NIFTY 50", "segment": "IDX_I", "security_id": 13},
-        {"name": "BANK NIFTY", "segment": "IDX_I", "security_id": 25},
-        {"name": "FIN NIFTY", "segment": "IDX_I", "security_id": 27},
-        {"name": "MIDCAP NIFTY", "segment": "IDX_I", "security_id": 442},
-        {"name": "SENSEX", "segment": "IDX_I", "security_id": 51},
-        {"name": "BANKEX", "segment": "IDX_I", "security_id": 69},
-    ]
-
-    quotes = {}
-    failures = []
-
-    for instrument in instruments:
-        key = (
-            instrument["segment"],
-            str(instrument["security_id"]),
-        )
-
-        parsed, error = direct_marketfeed_ltp(
-            {
-                instrument["segment"]: [
-                    instrument["security_id"]
-                ]
-            },
-            attempts=3,
-        )
-
-        row = parsed.get(key)
-
-        if row:
-            quotes[instrument["name"]] = {
-                "last_price": row["last_price"],
-                "segment": instrument["segment"],
-                "security_id": instrument["security_id"],
-            }
-        else:
-            failures.append(
-                f'{instrument["name"]}: {error or "unavailable"}'
-            )
-
-        # Market quote limit is 1 request per second.
-        time.sleep(1.05)
-
-    return quotes, failures
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_nse_trading_holidays(year):
-    """
-    Best-effort NSE trading holiday discovery.
-
-    If NSE blocks the request, the dashboard safely falls back to
-    weekday/time logic rather than displaying a false holiday.
-    """
-    url = "https://www.nseindia.com/api/holiday-master?type=trading"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/126 Safari/537.36"
-        ),
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://www.nseindia.com/resources/exchange-communication-holidays",
+def load_config() -> dict[str, Any]:
+    defaults = {
+        "client_id": "",
+        "access_token": "",
+        "market_ids": {name: data["security_id"] for name, data in DEFAULT_MARKETS.items()},
+        "india_vix_security_id": 0,
+        "refresh_seconds": 5,
     }
-
-    holidays = set()
-
     try:
-        session = requests.Session()
-        session.get(
-            "https://www.nseindia.com",
-            headers=headers,
-            timeout=8,
-        )
-        response = session.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-
-        containers = []
-
-        if isinstance(payload, dict):
-            containers.extend(payload.values())
-        elif isinstance(payload, list):
-            containers.append(payload)
-
-        for container in containers:
-            if not isinstance(container, list):
-                continue
-
-            for row in container:
-                if not isinstance(row, dict):
-                    continue
-
-                date_value = (
-                    row.get("tradingDate")
-                    or row.get("holidayDate")
-                    or row.get("date")
-                )
-
-                if not date_value:
-                    continue
-
-                parsed_date = pd.to_datetime(
-                    date_value,
-                    errors="coerce",
-                    dayfirst=True,
-                )
-
-                if pd.isna(parsed_date):
-                    continue
-
-                if parsed_date.year == year:
-                    holidays.add(parsed_date.date().isoformat())
-
+        if CONFIG_PATH.exists():
+            stored = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            defaults.update(stored)
     except Exception:
-        return set()
-
-    return holidays
-
+        pass
+    return defaults
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def fetch_nse_holiday_details(year):
-    """Return NSE trading holidays as {ISO date: holiday name}."""
-    url = "https://www.nseindia.com/api/holiday-master?type=trading"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://www.nseindia.com/resources/exchange-communication-holidays",
-    }
-    details = {}
-    try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=8)
-        response = session.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-        containers = list(payload.values()) if isinstance(payload, dict) else [payload]
-        for container in containers:
-            if not isinstance(container, list):
-                continue
-            for row in container:
-                if not isinstance(row, dict):
-                    continue
-                date_value = row.get("tradingDate") or row.get("holidayDate") or row.get("date")
-                parsed = pd.to_datetime(date_value, errors="coerce", dayfirst=True)
-                if pd.isna(parsed) or parsed.year != year:
-                    continue
-                name = row.get("description") or row.get("holidayDescription") or row.get("reason") or "Market Holiday"
-                details[parsed.date().isoformat()] = str(name)
-    except Exception as error:
-        add_api_log(f"Holiday calendar unavailable: {error}", "WARNING")
-    return details
+def save_config(config: dict[str, Any]) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
-def render_market_calendar(display_date=None):
-    display_date = display_date or datetime.now(IST).date()
-    holiday_details = fetch_nse_holiday_details(display_date.year)
-    month_matrix = calendar.Calendar(firstweekday=0).monthdayscalendar(display_date.year, display_date.month)
-    weekday_names = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-    cells = [f'<div class="cal-head">{name}</div>' for name in weekday_names]
-    for week in month_matrix:
-        for weekday, day in enumerate(week):
-            if day == 0:
-                cells.append('<div class="cal-day cal-empty"></div>')
-                continue
-            day_date = display_date.replace(day=day)
-            iso = day_date.isoformat()
-            classes = ["cal-day"]
-            note = "Trading Day"
-            if weekday >= 5:
-                classes.append("cal-weekend")
-                note = "Weekend"
-            if iso in holiday_details:
-                classes.append("cal-holiday")
-                note = holiday_details[iso]
-            if day_date == datetime.now(IST).date():
-                classes.append("cal-today")
-            cells.append(f'<div class="{" ".join(classes)}"><div class="cal-number">{day}</div><div class="cal-note">{note}</div></div>')
-    title = display_date.strftime("%B %Y")
-    legend = "🟠 Holiday &nbsp; 🔴 Weekend &nbsp; 🔵 Today"
-    render_html(f'<div class="market-calendar-wrap"><div class="market-calendar-title"><span>📅 NSE Market Calendar — {title}</span><span>{legend}</span></div><div class="market-calendar-grid">{"".join(cells)}</div></div>')
-
-
-def calculate_previous_day_pivots(candles):
-    """Classic pivots and CPR calculated from the latest completed trading session."""
-    if candles.empty or "Datetime" not in candles.columns:
-        return None
-    frame = candles.copy()
-    frame["SessionDate"] = frame["Datetime"].dt.date
-    today = datetime.now(IST).date()
-    completed = frame[frame["SessionDate"] < today]
-    if completed.empty:
-        unique_dates = sorted(frame["SessionDate"].dropna().unique())
-        if len(unique_dates) < 2:
-            return None
-        session_date = unique_dates[-2]
-    else:
-        session_date = completed["SessionDate"].max()
-    session = frame[frame["SessionDate"] == session_date]
-    if session.empty:
-        return None
-    high = safe_float(session["High"].max())
-    low = safe_float(session["Low"].min())
-    close = safe_float(session.iloc[-1]["Close"])
-    if not all(value > 0 for value in (high, low, close)):
-        return None
-    pivot = (high + low + close) / 3
-    r1 = 2 * pivot - low
-    s1 = 2 * pivot - high
-    r2 = pivot + (high - low)
-    s2 = pivot - (high - low)
-    r3 = high + 2 * (pivot - low)
-    s3 = low - 2 * (high - pivot)
-    bc = (high + low) / 2
-    tc = 2 * pivot - bc
-    if bc > tc:
-        bc, tc = tc, bc
-    return {"Date": session_date, "High": high, "Low": low, "Close": close, "Pivot": pivot, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3, "BC": bc, "TC": tc}
-
-
-def render_pivot_dashboard(pivots):
-    if not pivots:
-        st.warning("Previous-session candles are unavailable, so pivot points could not be calculated.")
-        return
-    cards = []
-    for label in ["R3", "R2", "R1"]:
-        cards.append(f'<div class="pivot-card pivot-resistance"><div class="pivot-label">{label} Resistance</div><div class="pivot-value">₹ {pivots[label]:,.2f}</div></div>')
-    cards.append(f'<div class="pivot-card pivot-main"><div class="pivot-label">Central Pivot</div><div class="pivot-value">₹ {pivots["Pivot"]:,.2f}</div></div>')
-    for label in ["S1", "S2", "S3"]:
-        cards.append(f'<div class="pivot-card pivot-support"><div class="pivot-label">{label} Support</div><div class="pivot-value">₹ {pivots[label]:,.2f}</div></div>')
-    cards.extend([
-        f'<div class="pivot-card pivot-cpr"><div class="pivot-label">CPR Top (TC)</div><div class="pivot-value">₹ {pivots["TC"]:,.2f}</div></div>',
-        f'<div class="pivot-card pivot-cpr"><div class="pivot-label">CPR Bottom (BC)</div><div class="pivot-value">₹ {pivots["BC"]:,.2f}</div></div>',
-    ])
-    st.subheader("🧭 Automatic Pivot Points & CPR")
-    st.caption(f'Calculated automatically from previous completed session: {pivots["Date"].strftime("%d-%m-%Y")} | H ₹{pivots["High"]:,.2f} • L ₹{pivots["Low"]:,.2f} • C ₹{pivots["Close"]:,.2f}')
-    render_html('<div class="pivot-grid">' + ''.join(cards) + '</div>')
-
-def professional_market_status():
-    now = datetime.now(IST)
-    today = now.date()
-    weekday = now.weekday()
-
-    holidays = fetch_nse_trading_holidays(today.year)
-    is_holiday = today.isoformat() in holidays
-
-    market_open = now.replace(
-        hour=9,
-        minute=15,
-        second=0,
-        microsecond=0,
-    )
-    market_close = now.replace(
-        hour=15,
-        minute=30,
-        second=0,
-        microsecond=0,
-    )
-
-    if is_holiday:
-        return (
-            False,
-            now,
-            "🟠 Exchange Holiday — live trading is closed.",
-            "Holiday",
-        )
-
-    if weekday >= 5:
-        return (
-            False,
-            now,
-            "🔴 Weekend — live trading is closed.",
-            "Closed",
-        )
-
-    if market_open <= now <= market_close:
-        return (
-            True,
-            now,
-            "🟢 Market Open — live values may change quickly.",
-            "Open",
-        )
-
-    return (
-        False,
-        now,
-        "🔴 Market Closed — showing the latest available session.",
-        "Closed",
-    )
-
-
-def format_api_error(response):
-    if isinstance(response, dict):
-        remarks = response.get("remarks")
-        if isinstance(remarks, dict):
-            message = (
-                remarks.get("error_message")
-                or remarks.get("error_type")
-                or remarks
-            )
-        else:
-            message = remarks
-
-        nested = response.get("data")
-        if isinstance(nested, dict):
-            nested = nested.get("data", nested)
-
-        return str(message or nested or response)
-
-    return str(response)
-
-
-def market_status():
-    is_open, now, note, _status = professional_market_status()
-    return is_open, now, note
-
-
-def make_beep_wav(
-    frequency=880,
-    duration=0.22,
-    sample_rate=22050,
-    volume=0.35,
-):
-    frame_count = int(duration * sample_rate)
-    buffer = io.BytesIO()
-
-    with wave.open(buffer, "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-
-        for index in range(frame_count):
-            value = int(
-                volume
-                * 32767
-                * math.sin(
-                    2 * math.pi * frequency * index / sample_rate
-                )
-            )
-            wav_file.writeframesraw(struct.pack("<h", value))
-
-    return buffer.getvalue()
-
-
-def play_signal_sound():
-    encoded = base64.b64encode(make_beep_wav()).decode("ascii")
-
-    st.markdown(
-        f"""
-        <audio autoplay>
-            <source src="data:audio/wav;base64,{encoded}" type="audio/wav">
-        </audio>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# =========================================================
-# DHAN API FUNCTIONS
-# =========================================================
-
-@st.cache_data(ttl=60)
-def get_expiry_list(
-    security_id,
-    segment,
-    client_id,
-    access_token,
-):
-    url = "https://api.dhan.co/v2/optionchain/expirylist"
-
-    headers = {
+def make_headers(client_id: str, access_token: str) -> dict[str, str]:
+    return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "access-token": access_token,
-        "client-id": client_id,
+        "access-token": access_token.strip(),
+        "client-id": client_id.strip(),
+        "dhanClientId": client_id.strip(),
     }
 
+
+def api_call(
+    method: str,
+    endpoint: str,
+    client_id: str,
+    access_token: str,
+    payload: dict[str, Any] | None = None,
+) -> ApiResult:
+    if not client_id.strip() or not access_token.strip():
+        return ApiResult(False, message="Client ID and Access Token are required.")
+
+    started = time_module.perf_counter()
+    try:
+        response = requests.request(
+            method=method,
+            url=f"{DHAN_BASE}{endpoint}",
+            headers=make_headers(client_id, access_token),
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        elapsed = round((time_module.perf_counter() - started) * 1000)
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text
+
+        if response.ok:
+            return ApiResult(True, body, "Success", response.status_code, elapsed)
+
+        if isinstance(body, dict):
+            message = (
+                body.get("errorMessage")
+                or body.get("message")
+                or body.get("remarks")
+                or body.get("errorCode")
+                or str(body)
+            )
+        else:
+            message = str(body)[:250]
+        return ApiResult(False, body, message, response.status_code, elapsed)
+
+    except requests.Timeout:
+        return ApiResult(False, message="Dhan request timed out.")
+    except requests.RequestException as exc:
+        return ApiResult(False, message=f"Network error: {exc}")
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def validate_connection(client_id: str, access_token: str) -> ApiResult:
+    return api_call("GET", "/positions", client_id, access_token)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_expiries(
+    client_id: str,
+    access_token: str,
+    underlying_scrip: int,
+    underlying_seg: str,
+) -> ApiResult:
     payload = {
-        "UnderlyingScrip": security_id,
-        "UnderlyingSeg": segment,
+        "UnderlyingScrip": int(underlying_scrip),
+        "UnderlyingSeg": underlying_seg,
     }
-
-    response = request_with_retry(
-        "POST",
-        url,
-        headers=headers,
-        json=payload,
-        timeout=20,
-    )
-    return response.json()
+    return api_call("POST", "/optionchain/expirylist", client_id, access_token, payload)
 
 
-def get_option_chain(security_id, segment, expiry):
-    url = "https://api.dhan.co/v2/optionchain"
-
+@st.cache_data(ttl=4, show_spinner=False)
+def fetch_option_chain(
+    client_id: str,
+    access_token: str,
+    underlying_scrip: int,
+    underlying_seg: str,
+    expiry: str,
+) -> ApiResult:
     payload = {
-        "UnderlyingScrip": security_id,
-        "UnderlyingSeg": segment,
+        "UnderlyingScrip": int(underlying_scrip),
+        "UnderlyingSeg": underlying_seg,
         "Expiry": expiry,
     }
-
-    response = request_with_retry(
-        "POST",
-        url,
-        headers=HEADERS,
-        json=payload,
-        timeout=20,
-    )
-    return response.json()
+    return api_call("POST", "/optionchain", client_id, access_token, payload)
 
 
-@st.cache_data(ttl=20)
-def get_intraday_candles(
-    security_id,
-    exchange_segment,
-    instrument,
-    interval,
-    client_id,
-    access_token,
-):
-    now = datetime.now(IST)
-    from_time = now - timedelta(days=7)
-
-    url = "https://api.dhan.co/v2/charts/intraday"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "access-token": access_token,
-        "client-id": client_id,
-    }
-
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_intraday(
+    client_id: str,
+    access_token: str,
+    security_id: int,
+    exchange_segment: str,
+    instrument: str,
+    interval: str,
+) -> ApiResult:
+    today = date.today()
     payload = {
         "securityId": str(security_id),
         "exchangeSegment": exchange_segment,
         "instrument": instrument,
         "interval": str(interval),
         "oi": False,
-        "fromDate": from_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "fromDate": (today - timedelta(days=5)).isoformat(),
+        "toDate": (today + timedelta(days=1)).isoformat(),
     }
-
-    response = request_with_retry(
-        "POST",
-        url,
-        headers=headers,
-        json=payload,
-        timeout=25,
-    )
-    return response.json()
+    return api_call("POST", "/charts/intraday", client_id, access_token, payload)
 
 
-def candles_to_dataframe(response):
-    required = ["open", "high", "low", "close", "volume", "timestamp"]
 
-    if not isinstance(response, dict):
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_ltp(
+    client_id: str,
+    access_token: str,
+    security_id: int,
+    exchange_segment: str = "IDX_I",
+) -> ApiResult:
+    payload = {exchange_segment: [int(security_id)]}
+    return api_call("POST", "/marketfeed/ltp", client_id, access_token, payload)
+
+
+def parse_ltp(raw: Any, security_id: int) -> float:
+    if not isinstance(raw, dict):
+        return np.nan
+    data = raw.get("data", raw)
+    if not isinstance(data, dict):
+        return np.nan
+    for segment_data in data.values():
+        if isinstance(segment_data, dict):
+            item = segment_data.get(str(security_id), segment_data.get(security_id))
+            if isinstance(item, dict):
+                return safe_float(item.get("last_price", item.get("ltp")), np.nan)
+    return np.nan
+
+
+def parse_expiries(raw: Any) -> list[str]:
+    if not isinstance(raw, dict):
+        return []
+    data = raw.get("data", raw)
+    if isinstance(data, list):
+        return [str(x)[:10] for x in data if x]
+    if isinstance(data, dict):
+        for key in ("data", "expiryList", "expiries", "expiry"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [str(x)[:10] for x in value if x]
+    return []
+
+
+def parse_candles(raw: Any) -> pd.DataFrame:
+    if not isinstance(raw, dict):
+        return pd.DataFrame()
+    data = raw.get("data", raw)
+    if not isinstance(data, dict):
         return pd.DataFrame()
 
-    if not all(key in response for key in required):
+    def get_array(*keys: str) -> list[Any]:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    opens = get_array("open", "o")
+    highs = get_array("high", "h")
+    lows = get_array("low", "l")
+    closes = get_array("close", "c")
+    volumes = get_array("volume", "v")
+    timestamps = get_array("timestamp", "start_Time", "time", "t")
+
+    lengths = [len(x) for x in (opens, highs, lows, closes, timestamps) if x]
+    if not lengths:
         return pd.DataFrame()
+    n = min(lengths)
 
-    lengths = [len(response.get(key, [])) for key in required]
-    row_count = min(lengths) if lengths else 0
-
-    if row_count == 0:
-        return pd.DataFrame()
-
-    frame = pd.DataFrame(
+    df = pd.DataFrame(
         {
-            "Open": response["open"][:row_count],
-            "High": response["high"][:row_count],
-            "Low": response["low"][:row_count],
-            "Close": response["close"][:row_count],
-            "Volume": response["volume"][:row_count],
-            "Timestamp": response["timestamp"][:row_count],
+            "timestamp": timestamps[:n],
+            "open": opens[:n],
+            "high": highs[:n],
+            "low": lows[:n],
+            "close": closes[:n],
+            "volume": (volumes[:n] if volumes else [0] * n),
         }
     )
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    frame["Datetime"] = pd.to_datetime(
-        frame["Timestamp"],
-        unit="s",
-        utc=True,
-    ).dt.tz_convert(IST)
+    # Dhan commonly supplies epoch timestamps.
+    numeric_ts = pd.to_numeric(df["timestamp"], errors="coerce")
+    if numeric_ts.notna().mean() > 0.8:
+        unit = "ms" if numeric_ts.dropna().median() > 10_000_000_000 else "s"
+        df["datetime"] = pd.to_datetime(numeric_ts, unit=unit, errors="coerce")
+    else:
+        df["datetime"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
-    for column in ["Open", "High", "Low", "Close", "Volume"]:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-
-    return frame.dropna().sort_values("Datetime").reset_index(drop=True)
-
-
-# =========================================================
-# TECHNICAL INDICATORS
-# =========================================================
-
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    average_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    average_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    relative_strength = average_gain / average_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + relative_strength))
-
-    return rsi.fillna(50)
+    df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
+    return df.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
 
 
-def calculate_vwap(frame):
-    typical_price = (
-        frame["High"] + frame["Low"] + frame["Close"]
-    ) / 3
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    x = df.copy()
 
-    cumulative_volume = frame["Volume"].cumsum().replace(0, pd.NA)
+    # EMA
+    x["ema9"] = x["close"].ewm(span=9, adjust=False).mean()
+    x["ema21"] = x["close"].ewm(span=21, adjust=False).mean()
 
-    return (
-        (typical_price * frame["Volume"]).cumsum()
-        / cumulative_volume
-    ).ffill()
+    # RSI 14
+    delta = x["close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    x["rsi"] = 100 - (100 / (1 + rs))
 
+    # VWAP, reset by date
+    typical = (x["high"] + x["low"] + x["close"]) / 3
+    x["_date"] = x["datetime"].dt.date
+    pv = typical * x["volume"].replace(0, np.nan)
+    x["vwap"] = (
+        pv.groupby(x["_date"]).cumsum()
+        / x["volume"].replace(0, np.nan).groupby(x["_date"]).cumsum()
+    )
+    x["vwap"] = x["vwap"].fillna(x["close"].expanding().mean())
 
-def calculate_atr(frame, period=10):
-    previous_close = frame["Close"].shift(1)
-
-    true_range = pd.concat(
+    # ATR 14
+    prev_close = x["close"].shift(1)
+    tr = pd.concat(
         [
-            frame["High"] - frame["Low"],
-            (frame["High"] - previous_close).abs(),
-            (frame["Low"] - previous_close).abs(),
+            x["high"] - x["low"],
+            (x["high"] - prev_close).abs(),
+            (x["low"] - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
+    x["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
-    return true_range.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
+    # Simplified Supertrend (10, 3)
+    period = 10
+    multiplier = 3.0
+    atr_st = tr.ewm(alpha=1 / period, adjust=False).mean()
+    hl2 = (x["high"] + x["low"]) / 2
+    upper = hl2 + multiplier * atr_st
+    lower = hl2 - multiplier * atr_st
 
+    final_upper = upper.copy()
+    final_lower = lower.copy()
+    direction = pd.Series(index=x.index, dtype=float)
+    supertrend = pd.Series(index=x.index, dtype=float)
 
-def calculate_supertrend(frame, period=10, multiplier=3.0):
-    output = frame.copy()
+    if len(x):
+        direction.iloc[0] = 1
+        supertrend.iloc[0] = lower.iloc[0]
 
-    if output.empty:
-        empty_float = pd.Series(dtype="float64")
-        empty_int = pd.Series(dtype="int64")
-        return empty_float, empty_int
+    for i in range(1, len(x)):
+        final_upper.iloc[i] = (
+            upper.iloc[i]
+            if upper.iloc[i] < final_upper.iloc[i - 1]
+            or x["close"].iloc[i - 1] > final_upper.iloc[i - 1]
+            else final_upper.iloc[i - 1]
+        )
+        final_lower.iloc[i] = (
+            lower.iloc[i]
+            if lower.iloc[i] > final_lower.iloc[i - 1]
+            or x["close"].iloc[i - 1] < final_lower.iloc[i - 1]
+            else final_lower.iloc[i - 1]
+        )
 
-    atr = calculate_atr(output, period)
-    hl2 = (output["High"] + output["Low"]) / 2
-
-    basic_upper = hl2 + multiplier * atr
-    basic_lower = hl2 - multiplier * atr
-
-    final_upper = pd.Series(index=output.index, dtype="float64")
-    final_lower = pd.Series(index=output.index, dtype="float64")
-    direction = pd.Series(0, index=output.index, dtype="int64")
-    supertrend = pd.Series(index=output.index, dtype="float64")
-
-    first_valid = atr.first_valid_index()
-
-    if first_valid is None:
-        return supertrend, direction
-
-    first_position = output.index.get_loc(first_valid)
-
-    final_upper.iloc[first_position] = basic_upper.iloc[first_position]
-    final_lower.iloc[first_position] = basic_lower.iloc[first_position]
-    direction.iloc[first_position] = 1
-    supertrend.iloc[first_position] = final_lower.iloc[first_position]
-
-    for position in range(first_position + 1, len(output)):
-        previous = position - 1
-
-        previous_upper = final_upper.iloc[previous]
-        previous_lower = final_lower.iloc[previous]
-
-        if not math.isfinite(safe_float(previous_upper, float("nan"))):
-            previous_upper = basic_upper.iloc[previous]
-
-        if not math.isfinite(safe_float(previous_lower, float("nan"))):
-            previous_lower = basic_lower.iloc[previous]
-
-        if (
-            basic_upper.iloc[position] < previous_upper
-            or output["Close"].iloc[previous] > previous_upper
-        ):
-            final_upper.iloc[position] = basic_upper.iloc[position]
+        if x["close"].iloc[i] > final_upper.iloc[i - 1]:
+            direction.iloc[i] = 1
+        elif x["close"].iloc[i] < final_lower.iloc[i - 1]:
+            direction.iloc[i] = -1
         else:
-            final_upper.iloc[position] = previous_upper
+            direction.iloc[i] = direction.iloc[i - 1]
 
-        if (
-            basic_lower.iloc[position] > previous_lower
-            or output["Close"].iloc[previous] < previous_lower
-        ):
-            final_lower.iloc[position] = basic_lower.iloc[position]
+        supertrend.iloc[i] = (
+            final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+        )
+
+    x["supertrend"] = supertrend
+    x["st_direction"] = direction
+    return x.drop(columns=["_date"], errors="ignore")
+
+
+def timeframe_signal(df: pd.DataFrame) -> dict[str, Any]:
+    result = {
+        "available": False,
+        "trend": "Waiting",
+        "score": 0,
+        "rsi": np.nan,
+        "vwap": np.nan,
+        "supertrend": "—",
+        "atr": np.nan,
+        "close": np.nan,
+        "reasons": [],
+    }
+    if df.empty or len(df) < 22:
+        result["reasons"] = ["Not enough candle data"]
+        return result
+
+    row = df.iloc[-1]
+    score = 50
+    reasons: list[str] = []
+
+    close = safe_float(row.get("close"), np.nan)
+    ema9 = safe_float(row.get("ema9"), np.nan)
+    ema21 = safe_float(row.get("ema21"), np.nan)
+    rsi = safe_float(row.get("rsi"), np.nan)
+    vwap = safe_float(row.get("vwap"), np.nan)
+    st_dir = safe_float(row.get("st_direction"), 0)
+
+    if close > vwap:
+        score += 12
+        reasons.append("Price above VWAP")
+    else:
+        score -= 12
+        reasons.append("Price below VWAP")
+
+    if ema9 > ema21:
+        score += 12
+        reasons.append("EMA 9 above EMA 21")
+    else:
+        score -= 12
+        reasons.append("EMA 9 below EMA 21")
+
+    if st_dir > 0:
+        score += 14
+        reasons.append("Supertrend bullish")
+    elif st_dir < 0:
+        score -= 14
+        reasons.append("Supertrend bearish")
+
+    if 55 <= rsi <= 70:
+        score += 9
+        reasons.append("RSI bullish zone")
+    elif 30 <= rsi <= 45:
+        score -= 9
+        reasons.append("RSI bearish zone")
+    elif rsi > 75:
+        score -= 4
+        reasons.append("RSI overbought")
+    elif rsi < 25:
+        score += 4
+        reasons.append("RSI oversold")
+
+    score = int(max(0, min(100, round(score))))
+    if score >= 62:
+        trend = "Bullish"
+    elif score <= 38:
+        trend = "Bearish"
+    else:
+        trend = "Sideways"
+
+    result.update(
+        {
+            "available": True,
+            "trend": trend,
+            "score": score,
+            "rsi": rsi,
+            "vwap": vwap,
+            "supertrend": "Bullish" if st_dir > 0 else "Bearish" if st_dir < 0 else "—",
+            "atr": safe_float(row.get("atr"), np.nan),
+            "close": close,
+            "reasons": reasons,
+        }
+    )
+    return result
+
+
+def extract_option_side(side: Any) -> dict[str, float]:
+    if not isinstance(side, dict):
+        return {}
+    greeks = side.get("greeks") if isinstance(side.get("greeks"), dict) else {}
+    return {
+        "ltp": safe_float(side.get("last_price", side.get("ltp"))),
+        "change": safe_float(side.get("net_change", side.get("change"))),
+        "oi": safe_float(side.get("oi")),
+        "oi_change": safe_float(side.get("oi_change", side.get("change_oi"))),
+        "volume": safe_float(side.get("volume")),
+        "iv": safe_float(side.get("implied_volatility", side.get("iv"))),
+        "bid": safe_float(side.get("top_bid_price", side.get("bid"))),
+        "ask": safe_float(side.get("top_ask_price", side.get("ask"))),
+        "delta": safe_float(greeks.get("delta", side.get("delta"))),
+        "theta": safe_float(greeks.get("theta", side.get("theta"))),
+        "gamma": safe_float(greeks.get("gamma", side.get("gamma"))),
+        "vega": safe_float(greeks.get("vega", side.get("vega"))),
+    }
+
+
+def parse_option_chain(raw: Any) -> tuple[pd.DataFrame, float | None]:
+    if not isinstance(raw, dict):
+        return pd.DataFrame(), None
+
+    data = raw.get("data", raw)
+    if not isinstance(data, dict):
+        return pd.DataFrame(), None
+
+    spot = data.get("last_price", data.get("underlying_ltp", data.get("spot")))
+    spot_value = safe_float(spot, np.nan)
+    if not math.isfinite(spot_value):
+        spot_value = None
+
+    oc = data.get("oc", data.get("optionChain", data.get("options", {})))
+    rows: list[dict[str, Any]] = []
+
+    if isinstance(oc, dict):
+        iterable = oc.items()
+    elif isinstance(oc, list):
+        iterable = [(item.get("strike_price", item.get("strike")), item) for item in oc if isinstance(item, dict)]
+    else:
+        iterable = []
+
+    for strike_key, item in iterable:
+        if not isinstance(item, dict):
+            continue
+        strike = safe_float(item.get("strike_price", strike_key), np.nan)
+        if not math.isfinite(strike):
+            continue
+        ce = extract_option_side(item.get("ce", item.get("call")))
+        pe = extract_option_side(item.get("pe", item.get("put")))
+        row = {"Strike": strike}
+        for prefix, values in (("CE", ce), ("PE", pe)):
+            for key, value in values.items():
+                row[f"{prefix}_{key.upper()}"] = value
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(), spot_value
+
+    df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
+    return df, spot_value
+
+
+def option_metrics(df: pd.DataFrame, spot: float | None) -> dict[str, Any]:
+    result = {
+        "pcr": np.nan,
+        "max_pain": np.nan,
+        "support": np.nan,
+        "resistance": np.nan,
+        "atm": np.nan,
+        "sentiment_score": 50,
+    }
+    if df.empty:
+        return result
+
+    ce_oi = pd.to_numeric(df.get("CE_OI", 0), errors="coerce").fillna(0)
+    pe_oi = pd.to_numeric(df.get("PE_OI", 0), errors="coerce").fillna(0)
+    total_ce = ce_oi.sum()
+    total_pe = pe_oi.sum()
+    pcr = total_pe / total_ce if total_ce > 0 else np.nan
+
+    support = df.loc[pe_oi.idxmax(), "Strike"] if pe_oi.max() > 0 else np.nan
+    resistance = df.loc[ce_oi.idxmax(), "Strike"] if ce_oi.max() > 0 else np.nan
+
+    if spot is not None:
+        atm_idx = (df["Strike"] - spot).abs().idxmin()
+        atm = df.loc[atm_idx, "Strike"]
+    else:
+        atm = np.nan
+
+    # Max pain approximation based on total intrinsic payout at each listed strike.
+    strikes = pd.to_numeric(df["Strike"], errors="coerce").to_numpy(dtype=float)
+    ce_arr = ce_oi.to_numpy(dtype=float)
+    pe_arr = pe_oi.to_numpy(dtype=float)
+    pain_values = []
+    for settlement in strikes:
+        call_pain = np.maximum(settlement - strikes, 0) * ce_arr
+        put_pain = np.maximum(strikes - settlement, 0) * pe_arr
+        pain_values.append(np.nansum(call_pain + put_pain))
+    max_pain = strikes[int(np.nanargmin(pain_values))] if pain_values else np.nan
+
+    sentiment = 50
+    if math.isfinite(pcr):
+        if 0.9 <= pcr <= 1.3:
+            sentiment += 8
+        elif 1.3 < pcr <= 1.8:
+            sentiment += 14
+        elif 0.55 <= pcr < 0.9:
+            sentiment -= 12
+        elif pcr > 1.8:
+            sentiment -= 4  # possible overcrowding
+        elif pcr < 0.55:
+            sentiment += 4  # possible extreme
+
+    result.update(
+        {
+            "pcr": pcr,
+            "max_pain": max_pain,
+            "support": support,
+            "resistance": resistance,
+            "atm": atm,
+            "sentiment_score": int(max(0, min(100, sentiment))),
+        }
+    )
+    return result
+
+
+def final_decision(
+    sig5: dict[str, Any],
+    sig15: dict[str, Any],
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    if not sig5["available"] or not sig15["available"]:
+        return {
+            "action": "WAIT — DATA NOT CONNECTED",
+            "confidence": 0,
+            "bias": "Neutral",
+            "css": "",
+            "reason": "Valid 5-minute and 15-minute candles are required.",
+        }
+
+    # 5m drives entry; 15m carries slightly more confirmation weight.
+    technical_score = round(sig5["score"] * 0.45 + sig15["score"] * 0.45 + metrics["sentiment_score"] * 0.10)
+    bearish_score = 100 - technical_score
+    agreement = sig5["trend"] == sig15["trend"] and sig5["trend"] in ("Bullish", "Bearish")
+
+    if agreement and sig5["trend"] == "Bullish":
+        confidence = technical_score
+        if confidence >= 80:
+            action = "BUY CE SETUP"
+            css = "buy"
+            reason = "5m entry and 15m confirmation are aligned bullish."
+        elif confidence >= 70:
+            action = "WAIT FOR BULLISH CONFIRMATION"
+            css = ""
+            reason = "Bullish bias exists, but confidence is below the 80% entry rule."
         else:
-            final_lower.iloc[position] = previous_lower
+            action = "NO TRADE"
+            css = ""
+            reason = "Bullish alignment is not strong enough."
+        bias = "Bullish"
 
-        previous_direction = direction.iloc[previous]
-
-        if previous_direction >= 0:
-            if output["Close"].iloc[position] < final_lower.iloc[position]:
-                direction.iloc[position] = -1
-                supertrend.iloc[position] = final_upper.iloc[position]
-            else:
-                direction.iloc[position] = 1
-                supertrend.iloc[position] = final_lower.iloc[position]
+    elif agreement and sig5["trend"] == "Bearish":
+        confidence = bearish_score
+        if confidence >= 80:
+            action = "BUY PE SETUP"
+            css = "sell"
+            reason = "5m entry and 15m confirmation are aligned bearish."
+        elif confidence >= 70:
+            action = "WAIT FOR BEARISH CONFIRMATION"
+            css = ""
+            reason = "Bearish bias exists, but confidence is below the 80% entry rule."
         else:
-            if output["Close"].iloc[position] > final_upper.iloc[position]:
-                direction.iloc[position] = 1
-                supertrend.iloc[position] = final_lower.iloc[position]
-            else:
-                direction.iloc[position] = -1
-                supertrend.iloc[position] = final_upper.iloc[position]
+            action = "NO TRADE"
+            css = ""
+            reason = "Bearish alignment is not strong enough."
+        bias = "Bearish"
 
-    supertrend = supertrend.ffill()
-    direction = direction.replace(0, pd.NA).ffill().fillna(0).astype(int)
+    else:
+        confidence = max(technical_score, bearish_score)
+        action = "WAIT — TIMEFRAMES NOT ALIGNED"
+        css = ""
+        reason = "5-minute entry and 15-minute confirmation disagree or are sideways."
+        bias = "Mixed"
 
-    return supertrend, direction
+    return {
+        "action": action,
+        "confidence": int(max(0, min(100, confidence))),
+        "bias": bias,
+        "css": css,
+        "reason": reason,
+    }
 
 
-def enrich_candles(frame):
-    if frame.empty:
-        return frame
 
-    output = frame.copy()
-    output["RSI"] = calculate_rsi(output["Close"], 14)
-    output["VWAP"] = calculate_vwap(output)
-    output["ATR"] = calculate_atr(output, 10)
 
-    supertrend, direction = calculate_supertrend(
-        output,
-        period=10,
-        multiplier=3.0,
+
+def option_flow_intelligence(df: pd.DataFrame, spot: float | None, metrics: dict[str, Any]) -> dict[str, Any]:
+    """Compact option-flow readout using OI, OI change, volume, IV and ATM straddle."""
+    out = {
+        "call_oi": 0.0, "put_oi": 0.0, "call_chg_oi": 0.0, "put_chg_oi": 0.0,
+        "call_volume": 0.0, "put_volume": 0.0, "atm_straddle": np.nan,
+        "expected_move_pct": np.nan, "flow_bias": "Neutral", "flow_score": 50,
+    }
+    if df.empty:
+        return out
+    work = df.copy()
+    for col in ("CE_OI", "PE_OI", "CE_OI_CHANGE", "PE_OI_CHANGE", "CE_VOLUME", "PE_VOLUME"):
+        work[col] = pd.to_numeric(work.get(col, 0), errors="coerce").fillna(0)
+    out["call_oi"] = float(work["CE_OI"].sum())
+    out["put_oi"] = float(work["PE_OI"].sum())
+    out["call_chg_oi"] = float(work["CE_OI_CHANGE"].sum())
+    out["put_chg_oi"] = float(work["PE_OI_CHANGE"].sum())
+    out["call_volume"] = float(work["CE_VOLUME"].sum())
+    out["put_volume"] = float(work["PE_VOLUME"].sum())
+
+    atm = safe_float(metrics.get("atm"), np.nan)
+    if math.isfinite(atm):
+        row = work.iloc[(pd.to_numeric(work["Strike"], errors="coerce") - atm).abs().argsort()[:1]]
+        if not row.empty:
+            row = row.iloc[0]
+            straddle = safe_float(row.get("CE_LTP"), 0) + safe_float(row.get("PE_LTP"), 0)
+            if straddle > 0:
+                out["atm_straddle"] = straddle
+                base = safe_float(spot, 0)
+                if base > 0:
+                    out["expected_move_pct"] = straddle / base * 100
+
+    score = 50
+    # Put OI / put OI addition is treated as supportive; call OI / call OI addition as overhead.
+    total_oi = max(out["call_oi"] + out["put_oi"], 1.0)
+    oi_edge = (out["put_oi"] - out["call_oi"]) / total_oi
+    score += max(-12, min(12, oi_edge * 40))
+    total_chg = max(abs(out["call_chg_oi"]) + abs(out["put_chg_oi"]), 1.0)
+    chg_edge = (out["put_chg_oi"] - out["call_chg_oi"]) / total_chg
+    score += max(-10, min(10, chg_edge * 25))
+    total_vol = max(out["call_volume"] + out["put_volume"], 1.0)
+    vol_edge = (out["put_volume"] - out["call_volume"]) / total_vol
+    score += max(-8, min(8, vol_edge * 20))
+    score = int(max(0, min(100, round(score))))
+    out["flow_score"] = score
+    out["flow_bias"] = "Bullish" if score >= 58 else "Bearish" if score <= 42 else "Neutral"
+    return out
+
+
+def select_best_option_contract(
+    chain: pd.DataFrame,
+    side: str,
+    metrics: dict[str, Any],
+    max_distance_steps: int = 2,
+) -> dict[str, Any]:
+    """Rank near-ATM contracts by tradability; avoids blindly selecting ATM."""
+    empty = {"ok": False, "strike": np.nan, "entry": np.nan, "score": 0, "spread_pct": np.nan,
+             "delta": np.nan, "iv": np.nan, "volume": 0.0, "oi": 0.0, "reason": "No suitable contract"}
+    if chain.empty or side not in ("CE", "PE"):
+        return empty
+    atm = safe_float(metrics.get("atm"), np.nan)
+    if not math.isfinite(atm):
+        return empty
+    work = chain.copy()
+    work["_distance"] = (pd.to_numeric(work["Strike"], errors="coerce") - atm).abs()
+    strikes = sorted(pd.to_numeric(work["Strike"], errors="coerce").dropna().unique())
+    steps = [abs(strikes[i+1]-strikes[i]) for i in range(len(strikes)-1) if strikes[i+1] > strikes[i]]
+    step = min(steps) if steps else max(atm * 0.002, 1.0)
+    work = work[work["_distance"] <= step * max_distance_steps + 1e-9].copy()
+    if work.empty:
+        return empty
+
+    best = None
+    for _, row in work.iterrows():
+        ltp = safe_float(row.get(f"{side}_LTP"), 0)
+        bid = safe_float(row.get(f"{side}_BID"), 0)
+        ask = safe_float(row.get(f"{side}_ASK"), 0)
+        volume = safe_float(row.get(f"{side}_VOLUME"), 0)
+        oi = safe_float(row.get(f"{side}_OI"), 0)
+        iv = safe_float(row.get(f"{side}_IV"), np.nan)
+        delta = abs(safe_float(row.get(f"{side}_DELTA"), np.nan))
+        if ltp <= 0:
+            continue
+        spread = ((ask - bid) / max((ask + bid) / 2, 0.01) * 100) if ask > 0 and bid > 0 and ask >= bid else 99.0
+        score = 0.0
+        score += max(0, 30 - min(spread, 10) * 5)
+        score += min(20, math.log10(max(volume, 1)) * 5)
+        score += min(20, math.log10(max(oi, 1)) * 4)
+        if math.isfinite(delta):
+            score += max(0, 20 - abs(delta - 0.50) * 50)
+        if math.isfinite(iv) and 5 <= iv <= 80:
+            score += 5
+        score += max(0, 5 - safe_float(row.get("_distance"), 0) / max(step, 1) * 2.5)
+        candidate = {"ok": spread <= 4.0 and volume >= 100 and oi >= 500,
+                     "strike": safe_float(row.get("Strike"), np.nan), "entry": ltp, "score": int(round(score)),
+                     "spread_pct": spread, "delta": delta, "iv": iv, "volume": volume, "oi": oi,
+                     "reason": f"quality {score:.0f}/100 • spread {spread:.1f}% • vol {compact_num(volume)} • OI {compact_num(oi)}"}
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best or empty
+
+def liquidity_filter(
+    chain: pd.DataFrame,
+    metrics: dict[str, Any],
+    max_spread_pct: float = 3.0,
+    min_volume: float = 500.0,
+    min_oi: float = 1000.0,
+) -> dict[str, Any]:
+    result = {
+        "ok": False,
+        "spread_pct": np.nan,
+        "volume": 0.0,
+        "oi": 0.0,
+        "reason": "Option chain unavailable",
+    }
+    if chain.empty:
+        return result
+    atm = safe_float(metrics.get("atm"), np.nan)
+    if not math.isfinite(atm):
+        result["reason"] = "ATM unavailable"
+        return result
+    row = chain.iloc[(pd.to_numeric(chain["Strike"], errors="coerce") - atm).abs().argsort()[:1]]
+    if row.empty:
+        return result
+    row = row.iloc[0]
+
+    candidates = []
+    for side in ("CE", "PE"):
+        bid = safe_float(row.get(f"{side}_BID"), 0)
+        ask = safe_float(row.get(f"{side}_ASK"), 0)
+        ltp = safe_float(row.get(f"{side}_LTP"), 0)
+        volume = safe_float(row.get(f"{side}_VOLUME"), 0)
+        oi = safe_float(row.get(f"{side}_OI"), 0)
+        if ask > 0 and bid > 0:
+            spread = (ask - bid) / max((ask + bid) / 2, 0.01) * 100
+        else:
+            spread = np.inf
+        candidates.append((side, spread, volume, oi, ltp))
+
+    best = min(candidates, key=lambda x: x[1]) if candidates else ("—", np.inf, 0, 0, 0)
+    side, spread, volume, oi, _ = best
+    ok = spread <= max_spread_pct and volume >= min_volume and oi >= min_oi
+    reason_parts = []
+    if spread > max_spread_pct:
+        reason_parts.append(f"spread {spread:.1f}%")
+    if volume < min_volume:
+        reason_parts.append(f"volume {volume:.0f}")
+    if oi < min_oi:
+        reason_parts.append(f"OI {oi:.0f}")
+    result.update(
+        {
+            "ok": ok,
+            "side": side,
+            "spread_pct": spread,
+            "volume": volume,
+            "oi": oi,
+            "reason": "Liquidity OK" if ok else "Weak liquidity: " + ", ".join(reason_parts),
+        }
+    )
+    return result
+
+
+def simple_backtest(df5: pd.DataFrame, df15: pd.DataFrame) -> dict[str, Any]:
+    """Conservative underlying-direction backtest; not an options-P&L backtest."""
+    empty = {"trades": 0, "win_rate": np.nan, "avg_move": np.nan, "profit_factor": np.nan}
+    if df5.empty or df15.empty or len(df5) < 60 or len(df15) < 25:
+        return empty
+
+    five = add_indicators(df5.copy()) if "rsi" not in df5 else df5.copy()
+    fifteen = add_indicators(df15.copy()) if "rsi" not in df15 else df15.copy()
+
+    fifteen = fifteen[["datetime", "close", "ema9", "ema21", "vwap", "st_direction", "rsi"]].copy()
+    fifteen["trend15"] = np.where(
+        (fifteen["close"] > fifteen["vwap"])
+        & (fifteen["ema9"] > fifteen["ema21"])
+        & (fifteen["st_direction"] > 0),
+        1,
+        np.where(
+            (fifteen["close"] < fifteen["vwap"])
+            & (fifteen["ema9"] < fifteen["ema21"])
+            & (fifteen["st_direction"] < 0),
+            -1,
+            0,
+        ),
     )
 
-    output["Supertrend"] = supertrend
-    output["TrendDirection"] = direction
-
-    return output
-
-
-
-# =========================================================
-# SMART MONEY / PRICE ACTION HEURISTICS
-# =========================================================
-
-def detect_fair_value_gaps(frame, lookback=80):
-    if frame.empty or len(frame) < 3:
-        return []
-
-    gaps = []
-    recent = frame.tail(lookback).reset_index(drop=True)
-
-    for index in range(2, len(recent)):
-        first = recent.iloc[index - 2]
-        third = recent.iloc[index]
-
-        if safe_float(third["Low"]) > safe_float(first["High"]):
-            gaps.append(
-                {
-                    "Type": "Bullish FVG",
-                    "Low": safe_float(first["High"]),
-                    "High": safe_float(third["Low"]),
-                    "Time": third["Datetime"],
-                }
-            )
-
-        if safe_float(third["High"]) < safe_float(first["Low"]):
-            gaps.append(
-                {
-                    "Type": "Bearish FVG",
-                    "Low": safe_float(third["High"]),
-                    "High": safe_float(first["Low"]),
-                    "Time": third["Datetime"],
-                }
-            )
-
-    return gaps[-5:]
-
-
-def detect_order_blocks(frame, lookback=60):
-    if frame.empty or len(frame) < 5:
-        return []
-
-    recent = frame.tail(lookback).reset_index(drop=True)
-    atr_value = safe_float(recent["ATR"].iloc[-1], 0.0)
-    blocks = []
-
-    for index in range(1, len(recent) - 2):
-        candle = recent.iloc[index]
-        next_one = recent.iloc[index + 1]
-        next_two = recent.iloc[index + 2]
-
-        displacement_up = (
-            safe_float(next_two["Close"]) - safe_float(candle["High"])
-        )
-        displacement_down = (
-            safe_float(candle["Low"]) - safe_float(next_two["Close"])
-        )
-
-        if (
-            safe_float(candle["Close"]) < safe_float(candle["Open"])
-            and displacement_up > max(atr_value * 0.6, 1)
-        ):
-            blocks.append(
-                {
-                    "Type": "Bullish Order Block",
-                    "Low": safe_float(candle["Low"]),
-                    "High": safe_float(candle["High"]),
-                    "Time": candle["Datetime"],
-                }
-            )
-
-        if (
-            safe_float(candle["Close"]) > safe_float(candle["Open"])
-            and displacement_down > max(atr_value * 0.6, 1)
-        ):
-            blocks.append(
-                {
-                    "Type": "Bearish Order Block",
-                    "Low": safe_float(candle["Low"]),
-                    "High": safe_float(candle["High"]),
-                    "Time": candle["Datetime"],
-                }
-            )
-
-    return blocks[-5:]
-
-
-def detect_liquidity_levels(frame, lookback=80):
-    if frame.empty:
-        return 0.0, 0.0
-
-    recent = frame.tail(lookback)
-    buy_side = safe_float(recent["High"].nlargest(3).mean())
-    sell_side = safe_float(recent["Low"].nsmallest(3).mean())
-
-    return buy_side, sell_side
-
-
-def detect_institutional_activity(frame, lookback=40):
-    if frame.empty or len(frame) < 5:
-        return "Unavailable", 0.0
-
-    recent = frame.tail(lookback).copy()
-    average_volume = safe_float(recent["Volume"].rolling(20).mean().iloc[-1])
-    last_volume = safe_float(recent["Volume"].iloc[-1])
-    volume_ratio = last_volume / average_volume if average_volume else 0.0
-
-    body = abs(
-        safe_float(recent["Close"].iloc[-1])
-        - safe_float(recent["Open"].iloc[-1])
+    merged = pd.merge_asof(
+        five.sort_values("datetime"),
+        fifteen[["datetime", "trend15"]].sort_values("datetime"),
+        on="datetime",
+        direction="backward",
     )
-    atr_value = safe_float(recent["ATR"].iloc[-1])
+    merged["trend5"] = np.where(
+        (merged["close"] > merged["vwap"])
+        & (merged["ema9"] > merged["ema21"])
+        & (merged["st_direction"] > 0)
+        & merged["rsi"].between(52, 72),
+        1,
+        np.where(
+            (merged["close"] < merged["vwap"])
+            & (merged["ema9"] < merged["ema21"])
+            & (merged["st_direction"] < 0)
+            & merged["rsi"].between(28, 48),
+            -1,
+            0,
+        ),
+    )
+    merged["signal"] = np.where(merged["trend5"] == merged["trend15"], merged["trend5"], 0)
+    merged["future_close"] = merged["close"].shift(-3)
+    merged["move"] = (merged["future_close"] - merged["close"]) / merged["close"]
+    trades = merged[(merged["signal"] != 0) & merged["future_close"].notna()].copy()
+    if trades.empty:
+        return empty
+    trades["signed_move"] = trades["move"] * trades["signal"]
+    wins = trades["signed_move"] > 0
+    gross_win = trades.loc[trades["signed_move"] > 0, "signed_move"].sum()
+    gross_loss = abs(trades.loc[trades["signed_move"] < 0, "signed_move"].sum())
+    return {
+        "trades": int(len(trades)),
+        "win_rate": float(wins.mean() * 100),
+        "avg_move": float(trades["signed_move"].mean() * 100),
+        "profit_factor": float(gross_win / gross_loss) if gross_loss > 0 else np.nan,
+    }
 
-    if volume_ratio >= 1.8 and body >= atr_value * 0.8:
-        direction = (
-            "Bullish Institutional Activity"
-            if recent["Close"].iloc[-1] > recent["Open"].iloc[-1]
-            else "Bearish Institutional Activity"
-        )
-        return direction, volume_ratio
 
-    if volume_ratio >= 1.3:
-        return "Elevated Institutional Activity", volume_ratio
+def calculate_pivots(df: pd.DataFrame) -> dict[str, float]:
+    """Classic floor pivots from the most recent completed trading day."""
+    empty = {k: np.nan for k in ("P", "R1", "R2", "R3", "S1", "S2", "S3", "PDH", "PDL", "PDC")}
+    if df.empty or "datetime" not in df:
+        return empty
+    x = df.copy()
+    x["_day"] = x["datetime"].dt.date
+    days = sorted(x["_day"].dropna().unique())
+    if not days:
+        return empty
+    today = date.today()
+    completed = [d for d in days if d < today]
+    chosen = completed[-1] if completed else days[-1]
+    day_df = x[x["_day"] == chosen]
+    if day_df.empty:
+        return empty
+    h = safe_float(day_df["high"].max(), np.nan)
+    l = safe_float(day_df["low"].min(), np.nan)
+    c = safe_float(day_df.iloc[-1]["close"], np.nan)
+    if not all(math.isfinite(v) for v in (h, l, c)):
+        return empty
+    p = (h + l + c) / 3
+    return {
+        "P": p,
+        "R1": 2 * p - l,
+        "S1": 2 * p - h,
+        "R2": p + (h - l),
+        "S2": p - (h - l),
+        "R3": h + 2 * (p - l),
+        "S3": l - 2 * (h - p),
+        "PDH": h,
+        "PDL": l,
+        "PDC": c,
+    }
 
-    return "Normal Activity", volume_ratio
+
+def build_trade_plan(
+    decision: dict[str, Any],
+    chain: pd.DataFrame,
+    metrics: dict[str, Any],
+    sig5: dict[str, Any],
+) -> dict[str, Any]:
+    """Build an indicative premium-based plan; never places an order."""
+    plan = {
+        "side": "WAIT",
+        "strike": np.nan,
+        "entry": np.nan,
+        "sl": np.nan,
+        "t1": np.nan,
+        "t2": np.nan,
+        "t3": np.nan,
+        "rr": "—",
+        "note": "No trade plan until both timeframes align and confidence reaches 80%.",
+    }
+    action = str(decision.get("action", ""))
+    if chain.empty or not (action.startswith("BUY CE") or action.startswith("BUY PE")):
+        return plan
+
+    side = "CE" if action.startswith("BUY CE") else "PE"
+    contract = select_best_option_contract(chain, side, metrics)
+    if not contract.get("ok"):
+        plan["note"] = "V10.3 blocked contract: " + str(contract.get("reason", "weak liquidity/quality"))
+        return plan
+    entry = safe_float(contract.get("entry"), np.nan)
+    if not math.isfinite(entry) or entry <= 0:
+        return plan
+
+    # Premium risk is capped near 18%, with a small ATR-sensitive adjustment.
+    atr = safe_float(sig5.get("atr"), 0)
+    underlying = max(safe_float(sig5.get("close"), 0), 1)
+    atr_pct = min(max(atr / underlying, 0), 0.03)
+    stop_pct = min(0.22, max(0.14, 0.16 + atr_pct * 2))
+    risk = max(entry * stop_pct, 0.05)
+    sl = max(entry - risk, 0.05)
+
+    plan.update(
+        {
+            "side": side,
+            "strike": safe_float(contract.get("strike"), np.nan),
+            "entry": entry,
+            "sl": sl,
+            "t1": entry + risk,
+            "t2": entry + 2 * risk,
+            "t3": entry + 3 * risk,
+            "rr": "1:3",
+            "note": "V10.3 selected liquid near-ATM contract • " + str(contract.get("reason", "")) + ". Confirm 5m candle close before entry.",
+        }
+    )
+    return plan
 
 
-def build_professional_candlestick(
-    candles,
-    support,
-    resistance,
-    max_pain,
-    order_blocks,
-    fair_value_gaps,
-    buy_liquidity,
-    sell_liquidity,
-):
-    recent = candles.tail(180).copy()
+def option_chain_styler(
+    display: pd.DataFrame,
+    atm: float,
+    support: float = np.nan,
+    resistance: float = np.nan,
+) -> Any:
+    """High-contrast option-chain styling: green support, red resistance, amber ATM."""
+    ce_cols = {c for c in display.columns if str(c).startswith("CE ")}
+    pe_cols = {c for c in display.columns if str(c).startswith("PE ")}
 
-    figure = go.Figure()
+    def style_row(row: pd.Series) -> list[str]:
+        strike = safe_float(row.get("STRIKE"), np.nan)
+        is_atm = math.isfinite(safe_float(atm, np.nan)) and abs(strike - atm) < 0.001
+        is_support = math.isfinite(safe_float(support, np.nan)) and abs(strike - support) < 0.001
+        is_resistance = math.isfinite(safe_float(resistance, np.nan)) and abs(strike - resistance) < 0.001
+        styles: list[str] = []
+        for col in row.index:
+            if col in ce_cols:
+                base = "background-color:#0b2639;color:#e8f7ff;"
+            elif col in pe_cols:
+                base = "background-color:#2a1721;color:#fff1f4;"
+            else:
+                base = "background-color:#101d2c;color:#ffffff;font-weight:800;"
 
-    figure.add_trace(
+            # Use solid colours because Streamlit/pandas Styler renders them more reliably than rgba overlays.
+            if is_support and is_resistance:
+                base = "background-color:#6f42c1;color:#ffffff;font-weight:950;border-top:2px solid #d8c4ff;border-bottom:2px solid #d8c4ff;"
+            elif is_support:
+                base = "background-color:#075c3b;color:#ecfff7;font-weight:950;border-top:2px solid #26e6a0;border-bottom:2px solid #26e6a0;"
+            elif is_resistance:
+                base = "background-color:#721b31;color:#fff2f5;font-weight:950;border-top:2px solid #ff5c78;border-bottom:2px solid #ff5c78;"
+
+            if is_atm:
+                if col == "STRIKE":
+                    base = "background-color:#d49400;color:#111111;font-weight:950;border:2px solid #ffd166;"
+                else:
+                    base += "border-top:2px solid #ffd166;border-bottom:2px solid #ffd166;"
+            styles.append(base)
+        return styles
+
+    return display.style.apply(style_row, axis=1).format(precision=2, na_rep="—")
+
+
+def option_oi_levels(df: pd.DataFrame) -> dict[str, float]:
+    """Return top two PE-OI supports and CE-OI resistances for terminal display."""
+    result = {"support1": np.nan, "support2": np.nan, "resistance1": np.nan, "resistance2": np.nan}
+    if df.empty:
+        return result
+    work = df.copy()
+    work["CE_OI"] = pd.to_numeric(work.get("CE_OI", 0), errors="coerce").fillna(0)
+    work["PE_OI"] = pd.to_numeric(work.get("PE_OI", 0), errors="coerce").fillna(0)
+    pe = work.nlargest(2, "PE_OI")
+    ce = work.nlargest(2, "CE_OI")
+    if len(pe) > 0: result["support1"] = safe_float(pe.iloc[0]["Strike"], np.nan)
+    if len(pe) > 1: result["support2"] = safe_float(pe.iloc[1]["Strike"], np.nan)
+    if len(ce) > 0: result["resistance1"] = safe_float(ce.iloc[0]["Strike"], np.nan)
+    if len(ce) > 1: result["resistance2"] = safe_float(ce.iloc[1]["Strike"], np.nan)
+    return result
+
+def chart_figure(df: pd.DataFrame, title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
         go.Candlestick(
-            x=recent["Datetime"],
-            open=recent["Open"],
-            high=recent["High"],
-            low=recent["Low"],
-            close=recent["Close"],
+            x=df["datetime"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
             name="Price",
         )
     )
+    if "vwap" in df:
+        fig.add_trace(go.Scatter(x=df["datetime"], y=df["vwap"], name="VWAP", mode="lines"))
+    if "ema9" in df:
+        fig.add_trace(go.Scatter(x=df["datetime"], y=df["ema9"], name="EMA 9", mode="lines"))
+    if "ema21" in df:
+        fig.add_trace(go.Scatter(x=df["datetime"], y=df["ema21"], name="EMA 21", mode="lines"))
+    if "supertrend" in df:
+        fig.add_trace(go.Scatter(x=df["datetime"], y=df["supertrend"], name="Supertrend", mode="lines"))
 
-    figure.add_trace(
-        go.Scatter(
-            x=recent["Datetime"],
-            y=recent["VWAP"],
-            mode="lines",
-            name="VWAP",
-            line={"width": 1.5},
-        )
-    )
-
-    valid_supertrend = recent["Supertrend"].where(
-        recent["Supertrend"].apply(lambda value: math.isfinite(safe_float(value)))
-    )
-
-    figure.add_trace(
-        go.Scatter(
-            x=recent["Datetime"],
-            y=valid_supertrend,
-            mode="lines",
-            name="Supertrend",
-            line={"width": 1.4},
-        )
-    )
-
-    for label, level in [
-        ("Support", support),
-        ("Resistance", resistance),
-        ("Max Pain", max_pain),
-        ("Buy-side Liquidity", buy_liquidity),
-        ("Sell-side Liquidity", sell_liquidity),
-    ]:
-        if level:
-            figure.add_hline(
-                y=level,
-                line_dash="dot",
-                annotation_text=label,
-                annotation_position="top left",
-            )
-
-    for block in order_blocks[-2:]:
-        figure.add_hrect(
-            y0=block["Low"],
-            y1=block["High"],
-            opacity=0.12,
-            line_width=0,
-            annotation_text=block["Type"],
-            annotation_position="top left",
-        )
-
-    for gap in fair_value_gaps[-2:]:
-        figure.add_hrect(
-            y0=gap["Low"],
-            y1=gap["High"],
-            opacity=0.08,
-            line_width=0,
-            annotation_text=gap["Type"],
-            annotation_position="bottom right",
-        )
-
-    figure.update_layout(
-        height=620,
-        margin={"l": 10, "r": 10, "t": 35, "b": 10},
+    fig.update_layout(
+        title=title,
+        height=470,
         xaxis_rangeslider_visible=False,
-        hovermode="x unified",
-        legend={"orientation": "h", "y": 1.02, "x": 0},
-        template="plotly_white",
-        title="TradingView-style Price Action Chart",
+        margin=dict(l=10, r=10, t=55, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(4,17,36,.55)",
+        font=dict(color="#eaf4ff"),
+        legend=dict(orientation="h", y=1.02, x=0),
     )
-
-    return figure
-
-
-def smc_bias(
-    spot_price,
-    order_blocks,
-    fair_value_gaps,
-    buy_liquidity,
-    sell_liquidity,
-):
-    bullish = 0
-    bearish = 0
-    reasons = []
-
-    for block in order_blocks[-3:]:
-        if block["Type"].startswith("Bullish") and spot_price >= block["High"]:
-            bullish += 1
-            reasons.append("Price is above a bullish order block.")
-        if block["Type"].startswith("Bearish") and spot_price <= block["Low"]:
-            bearish += 1
-            reasons.append("Price is below a bearish order block.")
-
-    for gap in fair_value_gaps[-3:]:
-        if gap["Type"].startswith("Bullish") and spot_price >= gap["High"]:
-            bullish += 1
-            reasons.append("Bullish FVG remains below price.")
-        if gap["Type"].startswith("Bearish") and spot_price <= gap["Low"]:
-            bearish += 1
-            reasons.append("Bearish FVG remains above price.")
-
-    if buy_liquidity and spot_price > buy_liquidity:
-        bullish += 1
-        reasons.append("Buy-side liquidity has been swept.")
-    if sell_liquidity and spot_price < sell_liquidity:
-        bearish += 1
-        reasons.append("Sell-side liquidity has been swept.")
-
-    if bullish > bearish:
-        return "Bullish SMC Bias", bullish - bearish, reasons
-    if bearish > bullish:
-        return "Bearish SMC Bias", bearish - bullish, reasons
-    return "Neutral SMC Bias", 0, reasons or ["No clear SMC imbalance."]
+    return fig
 
 
-# =========================================================
-# OPTION ANALYTICS
-# =========================================================
 
-def calculate_max_pain(dataframe):
-    if dataframe.empty:
-        return 0.0
-
-    strikes = dataframe["Strike"].astype(float).tolist()
-    best_strike = 0.0
-    minimum_total_payout = None
-
-    for settlement_price in strikes:
-        call_payout = (
-            (settlement_price - dataframe["Strike"]).clip(lower=0)
-            * dataframe["CE OI"]
-        ).sum()
-
-        put_payout = (
-            (dataframe["Strike"] - settlement_price).clip(lower=0)
-            * dataframe["PE OI"]
-        ).sum()
-
-        total_payout = call_payout + put_payout
-
-        if minimum_total_payout is None or total_payout < minimum_total_payout:
-            minimum_total_payout = total_payout
-            best_strike = settlement_price
-
-    return float(best_strike)
+def colorful_level_card(
+    label: str,
+    value: str,
+    sub: str,
+    icon: str,
+    css_class: str,
+) -> str:
+    return f"""
+<div class="level-card {css_class}">
+  <div class="level-icon">{icon}</div>
+  <div class="level-label">{label}</div>
+  <div class="level-value">{value}</div>
+  <div class="level-sub">{sub}</div>
+</div>
+"""
 
 
-def analyse_oi_build_up(
-    total_ce_change,
-    total_pe_change,
-    atm_ce_change,
-    atm_pe_change,
-):
-    notes = []
-
-    if total_ce_change > 0 and total_pe_change > 0:
-        if total_pe_change > total_ce_change:
-            summary = "Put writing is stronger"
-            bias = "Bullish"
-        elif total_ce_change > total_pe_change:
-            summary = "Call writing is stronger"
-            bias = "Bearish"
-        else:
-            summary = "Call and Put writing are balanced"
-            bias = "Neutral"
-
-    elif total_ce_change > 0 and total_pe_change <= 0:
-        summary = "Call writing with Put unwinding"
-        bias = "Bearish"
-
-    elif total_pe_change > 0 and total_ce_change <= 0:
-        summary = "Put writing with Call unwinding"
-        bias = "Bullish"
-
-    else:
-        summary = "Both sides show net unwinding"
-        bias = "Neutral / Volatile"
-
-    if atm_pe_change > atm_ce_change:
-        notes.append("ATM Put OI change is stronger.")
-    elif atm_ce_change > atm_pe_change:
-        notes.append("ATM Call OI change is stronger.")
-    else:
-        notes.append("ATM OI change is balanced.")
-
-    return summary, bias, notes
+def pivot_level_card(label: str, value: str, css_class: str) -> str:
+    return f"""
+<div class="pivot-card {css_class}">
+  <div class="pivot-label">{label}</div>
+  <div class="pivot-value">{value}</div>
+</div>
+"""
 
 
-def build_signal_and_score(
-    pcr,
-    total_ce_change,
-    total_pe_change,
-    atm_ce_change,
-    atm_pe_change,
-    spot_price,
-    support,
-    resistance,
-    max_pain,
-    latest_rsi,
-    latest_vwap,
-    trend_direction,
-):
-    bullish_points = 0
-    bearish_points = 0
-    reasons = []
-
-    if pcr >= 1.25:
-        bullish_points += 3
-        reasons.append("PCR strongly favours Put OI.")
-    elif pcr >= 1.10:
-        bullish_points += 2
-        reasons.append("PCR moderately favours Put OI.")
-    elif pcr <= 0.75:
-        bearish_points += 3
-        reasons.append("PCR strongly favours Call OI.")
-    elif pcr <= 0.90:
-        bearish_points += 2
-        reasons.append("PCR moderately favours Call OI.")
-    else:
-        reasons.append("PCR is near neutral.")
-
-    if total_pe_change > total_ce_change:
-        bullish_points += 2
-        reasons.append("Total Put OI change is stronger.")
-    elif total_ce_change > total_pe_change:
-        bearish_points += 2
-        reasons.append("Total Call OI change is stronger.")
-
-    if atm_pe_change > atm_ce_change:
-        bullish_points += 1
-        reasons.append("ATM Put OI change is stronger.")
-    elif atm_ce_change > atm_pe_change:
-        bearish_points += 1
-        reasons.append("ATM Call OI change is stronger.")
-
-    if support and spot_price > support:
-        bullish_points += 1
-        reasons.append("Spot is above Put-OI support.")
-
-    if resistance and spot_price < resistance:
-        bearish_points += 1
-        reasons.append("Spot is below Call-OI resistance.")
-
-    if max_pain:
-        if spot_price > max_pain:
-            bullish_points += 1
-            reasons.append("Spot is above Max Pain.")
-        elif spot_price < max_pain:
-            bearish_points += 1
-            reasons.append("Spot is below Max Pain.")
-
-    if latest_vwap:
-        if spot_price > latest_vwap:
-            bullish_points += 2
-            reasons.append("Spot is above VWAP.")
-        elif spot_price < latest_vwap:
-            bearish_points += 2
-            reasons.append("Spot is below VWAP.")
-
-    if latest_rsi >= 60:
-        bullish_points += 2
-        reasons.append("RSI confirms bullish momentum.")
-    elif latest_rsi <= 40:
-        bearish_points += 2
-        reasons.append("RSI confirms bearish momentum.")
-    else:
-        reasons.append("RSI is neutral.")
-
-    if trend_direction == 1:
-        bullish_points += 2
-        reasons.append("Supertrend direction is bullish.")
-    elif trend_direction == -1:
-        bearish_points += 2
-        reasons.append("Supertrend direction is bearish.")
-
-    net_score = bullish_points - bearish_points
-    total_points = max(bullish_points + bearish_points, 1)
-
-    if net_score >= 4:
-        recommendation = "BUY CE BIAS"
-        sentiment = "Bullish"
-        signal_class = "signal-bullish"
-        quality_score = min(
-            95,
-            max(60, round(55 + 40 * bullish_points / total_points)),
-        )
-
-    elif net_score <= -4:
-        recommendation = "BUY PE BIAS"
-        sentiment = "Bearish"
-        signal_class = "signal-bearish"
-        quality_score = min(
-            95,
-            max(60, round(55 + 40 * bearish_points / total_points)),
-        )
-
-    else:
-        recommendation = "WAIT / NO TRADE"
-        sentiment = "Sideways"
-        signal_class = "signal-neutral"
-        quality_score = min(72, max(40, 58 - abs(net_score) * 2))
-
-    return (
-        recommendation,
-        sentiment,
-        signal_class,
-        quality_score,
-        reasons,
-        bullish_points,
-        bearish_points,
+def metric_card(label: str, value: str, sub: str, value_class: str = "") -> None:
+    st.markdown(
+        f"""
+<div class="metric-card">
+  <div class="label">{label}</div>
+  <div class="value {value_class}">{value}</div>
+  <div class="sub">{sub}</div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
 
-def breakout_breakdown_status(
-    spot_price,
-    support,
-    resistance,
-    buffer_points,
-):
-    breakout_level = resistance + buffer_points
-    breakdown_level = support - buffer_points
+# ---------------------------------------------------------------------
+# SIDEBAR
+# ---------------------------------------------------------------------
+config = load_config()
 
-    if resistance and spot_price > breakout_level:
-        return (
-            "BREAKOUT CONFIRMED",
-            "alert-breakout",
-            f"Spot is above {breakout_level:,.0f}.",
-            breakout_level,
-            breakdown_level,
-        )
+# Persistent state fixes the V4 problem where clicking Validate connected
+# successfully but the next Streamlit rerun returned to FAST START/OFFLINE.
+if "live_enabled" not in st.session_state:
+    st.session_state.live_enabled = False
+if "last_validation_message" not in st.session_state:
+    st.session_state.last_validation_message = ""
+if "market_selector" not in st.session_state:
+    st.session_state.market_selector = "NIFTY 50"
 
-    if support and spot_price < breakdown_level:
-        return (
-            "BREAKDOWN CONFIRMED",
-            "alert-breakdown",
-            f"Spot is below {breakdown_level:,.0f}.",
-            breakout_level,
-            breakdown_level,
-        )
+def select_market_from_button(name: str) -> None:
+    """Synchronize the top index buttons with the sidebar selector."""
+    st.session_state.market_selector = name
 
-    return (
-        "WAIT FOR CONFIRMATION",
-        "alert-range",
-        (
-            f"Watch breakout above {breakout_level:,.0f} "
-            f"or breakdown below {breakdown_level:,.0f}."
-        ),
-        breakout_level,
-        breakdown_level,
+instrument_master = fetch_instrument_master()
+discovered_indices = discover_indices(instrument_master)
+AVAILABLE_MARKETS = {
+    name: discovered_indices.get(name, data)
+    for name, data in DEFAULT_MARKETS.items()
+}
+for extra_name in ("SENSEX", "BANKEX"):
+    if extra_name in discovered_indices:
+        AVAILABLE_MARKETS[extra_name] = discovered_indices[extra_name]
+
+with st.sidebar:
+    st.header("🔐 Dhan Connection")
+
+    client_id = st.text_input(
+        "Dhan Client ID",
+        value=read_secret("DHAN_CLIENT_ID", str(config.get("client_id", ""))),
+        placeholder="Example: 1100xxxxxx",
+    )
+    access_token = st.text_area(
+        "Dhan Access Token",
+        value=read_secret("DHAN_ACCESS_TOKEN", str(config.get("access_token", ""))),
+        height=150,
+        placeholder="Paste the current 24-hour token",
     )
 
+    s1, s2 = st.columns(2)
+    with s1:
+        save_clicked = st.button("💾 Save", use_container_width=True)
+    with s2:
+        validate_clicked = st.button("✅ Connect Live", use_container_width=True)
 
-def select_option_contract(
-    dataframe,
-    recommendation,
-    atm_strike,
-):
-    row = dataframe.loc[dataframe["Strike"] == atm_strike]
+    if save_clicked:
+        if client_id.strip() and access_token.strip():
+            config["client_id"] = client_id.strip()
+            config["access_token"] = access_token.strip()
+            save_config(config)
+            st.success("Credentials saved on this computer.")
+        else:
+            st.warning("Enter Client ID and Access Token.")
 
-    if row.empty:
-        return "WAIT", atm_strike, 0.0
+    if validate_clicked:
+        if client_id.strip() and access_token.strip():
+            # Save first, then keep live mode enabled across all later reruns.
+            config["client_id"] = client_id.strip()
+            config["access_token"] = access_token.strip()
+            save_config(config)
+            st.session_state.live_enabled = True
+            st.cache_data.clear()
+        else:
+            st.session_state.live_enabled = False
+            st.warning("Enter Client ID and Access Token.")
 
-    candidate = row.iloc[0]
+    if st.button("🗑 Clear Token", use_container_width=True):
+        config["client_id"] = ""
+        config["access_token"] = ""
+        save_config(config)
+        st.session_state.live_enabled = False
+        st.cache_data.clear()
+        st.success("Token cleared. Refresh once.")
 
-    if recommendation == "BUY CE BIAS":
-        return "CE", atm_strike, safe_float(candidate["CE LTP"])
-
-    if recommendation == "BUY PE BIAS":
-        return "PE", atm_strike, safe_float(candidate["PE LTP"])
-
-    return "WAIT", atm_strike, 0.0
-
-
-def calculate_option_premium_levels(
-    premium,
-    recommendation,
-    atr_reference,
-):
-    if recommendation == "WAIT / NO TRADE" or premium <= 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-
-    entry = premium
-
-    # Premium SL remains conservative. ATR reference adds a small buffer.
-    risk_percent = 0.20
-    if atr_reference > 0:
-        risk_percent = min(0.28, max(0.15, atr_reference / 1000))
-
-    stop_loss = max(0.05, premium * (1 - risk_percent))
-    risk_amount = entry - stop_loss
-
-    target1 = entry + risk_amount * 1.0
-    target2 = entry + risk_amount * 1.5
-    target3 = entry + risk_amount * 2.0
-
-    return entry, stop_loss, target1, target2, target3
-
-
-def add_signal_to_log(
-    index_name,
-    expiry,
-    recommendation,
-    strike,
-    option_type,
-    premium_entry,
-    premium_stop,
-    target1,
-    quality_score,
-):
-    now_text = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
-    entry = {
-        "Time": now_text,
-        "Index": index_name,
-        "Expiry": expiry,
-        "Signal": recommendation,
-        "Strike": strike,
-        "Option": option_type,
-        "Entry Premium": premium_entry,
-        "Stop Premium": premium_stop,
-        "Target 1": target1,
-        "Quality Score": quality_score,
-    }
-
-    existing = st.session_state.signal_log
-
-    if not existing or (
-        existing[-1]["Signal"] != recommendation
-        or existing[-1]["Index"] != index_name
-        or existing[-1]["Strike"] != strike
-    ):
-        existing.append(entry)
-
-
-
-
-# =========================================================
-# MULTI-TIMEFRAME ENGINE
-# =========================================================
-
-def timeframe_snapshot(frame):
-    if frame.empty:
-        return {
-            "Available": False,
-            "Close": 0.0,
-            "RSI": 50.0,
-            "VWAP": 0.0,
-            "ATR": 0.0,
-            "Trend": 0,
-            "Supertrend": 0.0,
-            "Bias": "Unavailable",
-            "Score": 0,
-        }
-
-    latest = frame.iloc[-1]
-    close_price = safe_float(latest["Close"])
-    rsi_value = safe_float(latest["RSI"], 50.0)
-    vwap_value = safe_float(latest["VWAP"])
-    atr_value = safe_float(latest["ATR"])
-    trend_value = safe_int(latest["TrendDirection"])
-    supertrend_value = safe_float(latest["Supertrend"])
-
-    bullish = 0
-    bearish = 0
-
-    if close_price > vwap_value:
-        bullish += 2
-    elif close_price < vwap_value:
-        bearish += 2
-
-    if rsi_value >= 58:
-        bullish += 2
-    elif rsi_value <= 42:
-        bearish += 2
-
-    if trend_value == 1:
-        bullish += 3
-    elif trend_value == -1:
-        bearish += 3
-
-    net_score = bullish - bearish
-
-    if net_score >= 3:
-        bias = "Bullish"
-    elif net_score <= -3:
-        bias = "Bearish"
+    st.divider()
+    st.subheader("⚙️ Market Setup")
+    if discovered_indices:
+        st.caption(f"Official Dhan master: {len(discovered_indices)} index mappings resolved.")
     else:
-        bias = "Neutral"
+        st.warning("Instrument master unavailable; fallback IDs are being used.")
+    if st.session_state.market_selector not in AVAILABLE_MARKETS:
+        st.session_state.market_selector = next(iter(AVAILABLE_MARKETS))
+    selected_market = st.selectbox(
+        "Market",
+        list(AVAILABLE_MARKETS.keys()),
+        key="market_selector",
+    )
+    market_info = AVAILABLE_MARKETS[selected_market]
 
-    return {
-        "Available": True,
-        "Close": close_price,
-        "RSI": rsi_value,
-        "VWAP": vwap_value,
-        "ATR": atr_value,
-        "Trend": trend_value,
-        "Supertrend": supertrend_value,
-        "Bias": bias,
-        "Score": net_score,
-    }
+    stored_ids = config.get("market_ids", {})
+    security_id = int(
+        st.number_input(
+            "Underlying Security ID",
+            min_value=1,
+            step=1,
+            value=int(stored_ids.get(selected_market, market_info["security_id"])),
+            help="Verify this ID from Dhan's current instrument master.",
+        )
+    )
 
+    if st.button("Save Market ID", use_container_width=True):
+        config.setdefault("market_ids", {})[selected_market] = security_id
+        save_config(config)
+        st.success("Market ID saved.")
 
-def mtf_confirmation(snapshot_5m, snapshot_15m):
-    reasons = []
-    confirmation_points = 0
+    auto_load = st.toggle(
+        "Keep Live Data ON",
+        value=bool(st.session_state.live_enabled),
+        help="After Connect Live succeeds, this remains ON across dropdown and tab reruns.",
+    )
+    st.session_state.live_enabled = bool(auto_load)
 
-    if not snapshot_5m["Available"] or not snapshot_15m["Available"]:
-        return {
-            "Bias": "Unavailable",
-            "Class": "mtf-neutral",
-            "Confidence Boost": 0,
-            "Points": 0,
-            "Reasons": ["Both 5-minute and 15-minute data are required."],
-        }
+    refresh_seconds = st.select_slider(
+        "Live refresh interval",
+        options=[3, 5, 10, 15, 30, 60],
+        value=int(config.get("refresh_seconds", 5)),
+        help="Option chain is never requested faster than Dhan's 3-second limit.",
+    )
+    config["refresh_seconds"] = int(refresh_seconds)
 
-    bias_5m = snapshot_5m["Bias"]
-    bias_15m = snapshot_15m["Bias"]
+    auto_refresh = st.toggle(
+        "Auto Refresh",
+        value=False,
+        help="Requires streamlit-autorefresh. Manual Refresh still works without it.",
+    )
+    refresh_clicked = st.button("🔄 Refresh Now", use_container_width=True)
+    if refresh_clicked:
+        st.session_state.live_enabled = True
+        st.cache_data.clear()
 
-    if bias_5m == bias_15m and bias_5m == "Bullish":
-        confirmation_points += 5
-        reasons.append("5-minute and 15-minute trends both agree bullish.")
+    st.subheader("🇮🇳 India VIX Setup")
+    auto_vix_id = int(discovered_indices.get("INDIA VIX", {}).get("security_id", 0))
+    india_vix_security_id = int(
+        st.number_input(
+            "India VIX Security ID",
+            min_value=0,
+            step=1,
+            value=int(auto_vix_id or config.get("india_vix_security_id", 0)),
+            help="V9 resolves this automatically from Dhan's official instrument master. Manual override remains available.",
+        )
+    )
+    if auto_vix_id > 0:
+        st.caption(f"✅ India VIX auto-detected: Security ID {auto_vix_id}")
+    config["india_vix_security_id"] = india_vix_security_id
+    if st.button("Save V7 Settings", use_container_width=True):
+        save_config(config)
+        st.success("Refresh and VIX settings saved.")
 
-    elif bias_5m == bias_15m and bias_5m == "Bearish":
-        confirmation_points -= 5
-        reasons.append("5-minute and 15-minute trends both agree bearish.")
+    st.divider()
+    st.caption(
+        "Security: On Streamlit Cloud, use Secrets named DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN. "
+        "Local Save writes a hidden JSON beside this file; never upload that JSON to GitHub."
+    )
 
+# ---------------------------------------------------------------------
+# CONNECTION & FETCH
+# ---------------------------------------------------------------------
+credentials_present = bool(client_id.strip() and access_token.strip())
+should_check_connection = credentials_present and (
+    validate_clicked or refresh_clicked or st.session_state.live_enabled
+)
+connection = (
+    validate_connection(client_id.strip(), access_token.strip())
+    if should_check_connection
+    else ApiResult(False, message="Not checked")
+)
+
+if validate_clicked:
+    if connection.ok:
+        st.session_state.live_enabled = True
+        st.session_state.last_validation_message = (
+            f"Dhan API connected successfully ({connection.elapsed_ms or 0} ms)."
+        )
     else:
-        reasons.append(
-            f"Timeframes disagree: 5m={bias_5m}, 15m={bias_15m}."
+        st.session_state.live_enabled = False
+        st.session_state.last_validation_message = f"Connection failed: {connection.message}"
+
+load_live = credentials_present and connection.ok and st.session_state.live_enabled
+
+if auto_refresh and load_live:
+    if st_autorefresh is not None:
+        st_autorefresh(
+            interval=max(int(refresh_seconds), 3) * 1000,
+            key="v7_live_refresh",
         )
-
-    if snapshot_5m["Trend"] == snapshot_15m["Trend"] == 1:
-        confirmation_points += 2
-        reasons.append("Supertrend agrees bullish on both timeframes.")
-
-    elif snapshot_5m["Trend"] == snapshot_15m["Trend"] == -1:
-        confirmation_points -= 2
-        reasons.append("Supertrend agrees bearish on both timeframes.")
-
-    if (
-        snapshot_5m["Close"] > snapshot_5m["VWAP"]
-        and snapshot_15m["Close"] > snapshot_15m["VWAP"]
-    ):
-        confirmation_points += 2
-        reasons.append("Price is above VWAP on both timeframes.")
-
-    elif (
-        snapshot_5m["Close"] < snapshot_5m["VWAP"]
-        and snapshot_15m["Close"] < snapshot_15m["VWAP"]
-    ):
-        confirmation_points -= 2
-        reasons.append("Price is below VWAP on both timeframes.")
-
-    if snapshot_5m["RSI"] >= 55 and snapshot_15m["RSI"] >= 55:
-        confirmation_points += 1
-        reasons.append("RSI confirms bullish momentum on both timeframes.")
-
-    elif snapshot_5m["RSI"] <= 45 and snapshot_15m["RSI"] <= 45:
-        confirmation_points -= 1
-        reasons.append("RSI confirms bearish momentum on both timeframes.")
-
-    if confirmation_points >= 6:
-        bias = "Strong Bullish Confirmation"
-        css_class = "mtf-bullish"
-        confidence_boost = 8
-    elif confirmation_points >= 3:
-        bias = "Bullish Confirmation"
-        css_class = "mtf-bullish"
-        confidence_boost = 5
-    elif confirmation_points <= -6:
-        bias = "Strong Bearish Confirmation"
-        css_class = "mtf-bearish"
-        confidence_boost = 8
-    elif confirmation_points <= -3:
-        bias = "Bearish Confirmation"
-        css_class = "mtf-bearish"
-        confidence_boost = 5
     else:
-        bias = "Mixed / No Confirmation"
-        css_class = "mtf-neutral"
-        confidence_boost = -8
+        st.sidebar.warning(
+            "Auto Refresh requires: py -m pip install streamlit-autorefresh"
+        )
 
-    return {
-        "Bias": bias,
-        "Class": css_class,
-        "Confidence Boost": confidence_boost,
-        "Points": confirmation_points,
-        "Reasons": reasons,
-    }
-
-
-def refine_recommendation_with_mtf(
-    recommendation,
-    quality_score,
-    mtf_result,
-    snapshot_5m,
-    snapshot_15m,
-):
-    refined = recommendation
-    refined_score = quality_score
-    notes = []
-
-    mtf_bias = mtf_result["Bias"]
-    boost = mtf_result["Confidence Boost"]
-
-    if recommendation == "BUY CE BIAS":
-        if "Bullish" in mtf_bias:
-            refined_score += boost
-            notes.append("CE bias confirmed by 5m + 15m.")
-        elif "Bearish" in mtf_bias:
-            refined = "WAIT / NO TRADE"
-            refined_score = min(refined_score, 55)
-            notes.append("CE bias cancelled because MTF confirmation is bearish.")
-        else:
-            refined_score += boost
-            notes.append("CE bias reduced because MTF confirmation is mixed.")
-
-    elif recommendation == "BUY PE BIAS":
-        if "Bearish" in mtf_bias:
-            refined_score += boost
-            notes.append("PE bias confirmed by 5m + 15m.")
-        elif "Bullish" in mtf_bias:
-            refined = "WAIT / NO TRADE"
-            refined_score = min(refined_score, 55)
-            notes.append("PE bias cancelled because MTF confirmation is bullish.")
-        else:
-            refined_score += boost
-            notes.append("PE bias reduced because MTF confirmation is mixed.")
-
-    else:
-        if "Strong Bullish" in mtf_bias:
-            refined = "BUY CE BIAS"
-            refined_score = max(refined_score, 68)
-            notes.append("MTF engine upgraded WAIT to cautious CE bias.")
-        elif "Strong Bearish" in mtf_bias:
-            refined = "BUY PE BIAS"
-            refined_score = max(refined_score, 68)
-            notes.append("MTF engine upgraded WAIT to cautious PE bias.")
-        else:
-            notes.append("MTF engine keeps the signal at WAIT.")
-
-    refined_score = max(35, min(96, int(round(refined_score))))
-
-    return refined, refined_score, notes
-
-
-
-def mtf_trade_direction(snapshot):
-    if not snapshot.get("Available"):
-        return "UNAVAILABLE"
-
-    bullish_points = 0
-    bearish_points = 0
-
-    if snapshot["Trend"] == 1:
-        bullish_points += 3
-    elif snapshot["Trend"] == -1:
-        bearish_points += 3
-
-    if snapshot["Close"] > snapshot["VWAP"]:
-        bullish_points += 2
-    elif snapshot["Close"] < snapshot["VWAP"]:
-        bearish_points += 2
-
-    if snapshot["RSI"] >= 55:
-        bullish_points += 2
-    elif snapshot["RSI"] <= 45:
-        bearish_points += 2
-
-    if bullish_points - bearish_points >= 3:
-        return "BUY CE"
-
-    if bearish_points - bullish_points >= 3:
-        return "BUY PE"
-
-    return "WAIT"
-
-
-def calculate_mtf_agreement(snapshot_5m, snapshot_15m):
-    checks = []
-
-    direction_5m = mtf_trade_direction(snapshot_5m)
-    direction_15m = mtf_trade_direction(snapshot_15m)
-
-    checks.append(direction_5m == direction_15m and direction_5m != "WAIT")
-    checks.append(snapshot_5m["Trend"] == snapshot_15m["Trend"])
-    checks.append(
-        (snapshot_5m["Close"] > snapshot_5m["VWAP"])
-        == (snapshot_15m["Close"] > snapshot_15m["VWAP"])
+expiries: list[str] = []
+expiry_result = ApiResult(False, message="Not loaded")
+if load_live:
+    expiry_result = fetch_expiries(
+        client_id.strip(),
+        access_token.strip(),
+        security_id,
+        market_info["segment"],
     )
-    checks.append(
-        (snapshot_5m["RSI"] >= 50)
-        == (snapshot_15m["RSI"] >= 50)
-    )
-
-    valid_checks = [bool(value) for value in checks]
-    agreement = int(round(sum(valid_checks) / len(valid_checks) * 100))
-
-    return agreement, direction_5m, direction_15m
-
-
-def calculate_ai_confidence(
-    base_score,
-    agreement,
-    direction_5m,
-    direction_15m,
-    mtf_points,
-):
-    confidence = float(base_score)
-
-    if direction_5m == direction_15m and direction_5m in {"BUY CE", "BUY PE"}:
-        confidence += 8
-
-    if agreement >= 100:
-        confidence += 5
-    elif agreement >= 75:
-        confidence += 2
-    elif agreement <= 50:
-        confidence -= 10
-
-    confidence += min(5, abs(mtf_points) * 0.5)
-
-    return max(35, min(97, int(round(confidence))))
-
-
-def final_mtf_recommendation(
-    base_recommendation,
-    direction_5m,
-    direction_15m,
-    agreement,
-    confidence,
-):
-    if (
-        direction_5m == direction_15m == "BUY CE"
-        and agreement >= 75
-        and confidence >= 65
-    ):
-        return "BUY CE"
-
-    if (
-        direction_5m == direction_15m == "BUY PE"
-        and agreement >= 75
-        and confidence >= 65
-    ):
-        return "BUY PE"
-
-    if direction_5m != direction_15m:
-        return "WAIT — TIMEFRAMES NOT ALIGNED"
-
-    if base_recommendation == "BUY CE BIAS":
-        return "WATCH CE — WAIT FOR CONFIRMATION"
-
-    if base_recommendation == "BUY PE BIAS":
-        return "WATCH PE — WAIT FOR CONFIRMATION"
-
-    return "WAIT / NO TRADE"
-
-
-
-def build_three_timeframe_grade(
-    snapshot_5m,
-    snapshot_15m,
-    snapshot_60m,
-    agreement_5_15,
-    ai_confidence,
-):
-    direction_5m = mtf_trade_direction(snapshot_5m)
-    direction_15m = mtf_trade_direction(snapshot_15m)
-    direction_60m = mtf_trade_direction(snapshot_60m)
-
-    aligned_count = 0
-    directions = [direction_5m, direction_15m, direction_60m]
-
-    for direction in {"BUY CE", "BUY PE"}:
-        aligned_count = max(aligned_count, directions.count(direction))
-
-    if (
-        direction_5m == direction_15m == direction_60m == "BUY CE"
-        and agreement_5_15 >= 75
-        and ai_confidence >= 80
-    ):
-        return {
-            "Grade": "STRONG BUY CE",
-            "Class": "grade-strong-buy",
-            "Direction": "BUY CE",
-            "Score": min(97, ai_confidence + 4),
-            "Reason": "5m, 15m and 60m all confirm bullish conditions.",
-        }
-
-    if (
-        direction_5m == direction_15m == direction_60m == "BUY PE"
-        and agreement_5_15 >= 75
-        and ai_confidence >= 80
-    ):
-        return {
-            "Grade": "STRONG BUY PE",
-            "Class": "grade-strong-buy",
-            "Direction": "BUY PE",
-            "Score": min(97, ai_confidence + 4),
-            "Reason": "5m, 15m and 60m all confirm bearish conditions.",
-        }
-
-    if (
-        direction_5m == direction_15m == "BUY CE"
-        and direction_60m in {"BUY CE", "WAIT"}
-        and ai_confidence >= 68
-    ):
-        return {
-            "Grade": "MODERATE BUY CE",
-            "Class": "grade-moderate-buy",
-            "Direction": "BUY CE",
-            "Score": ai_confidence,
-            "Reason": "5m and 15m agree bullish; 60m is not opposing.",
-        }
-
-    if (
-        direction_5m == direction_15m == "BUY PE"
-        and direction_60m in {"BUY PE", "WAIT"}
-        and ai_confidence >= 68
-    ):
-        return {
-            "Grade": "MODERATE BUY PE",
-            "Class": "grade-moderate-buy",
-            "Direction": "BUY PE",
-            "Score": ai_confidence,
-            "Reason": "5m and 15m agree bearish; 60m is not opposing.",
-        }
-
-    if direction_5m != direction_15m:
-        return {
-            "Grade": "WAIT — TIMEFRAMES NOT ALIGNED",
-            "Class": "grade-wait",
-            "Direction": "WAIT",
-            "Score": ai_confidence,
-            "Reason": "5m and 15m disagree, so no fresh entry is allowed.",
-        }
-
-    if direction_60m not in {"WAIT", direction_15m}:
-        return {
-            "Grade": "AVOID — HIGHER TIMEFRAME OPPOSING",
-            "Class": "grade-avoid",
-            "Direction": "WAIT",
-            "Score": min(ai_confidence, 55),
-            "Reason": "60m trend opposes the lower-timeframe setup.",
-        }
-
-    return {
-        "Grade": "WAIT — NO HIGH-QUALITY SETUP",
-        "Class": "grade-wait",
-        "Direction": "WAIT",
-        "Score": min(ai_confidence, 65),
-        "Reason": "Conditions are incomplete or confidence is below threshold.",
-    }
-
-
-
-def directional_bias_plan(
-    snapshot_5m,
-    snapshot_15m,
-    snapshot_60m,
-    spot_price,
-    support,
-    resistance,
-    atm_strike,
-):
-    direction_5m = mtf_trade_direction(snapshot_5m)
-    direction_15m = mtf_trade_direction(snapshot_15m)
-    direction_60m = mtf_trade_direction(snapshot_60m)
-
-    bullish_weight = 0
-    bearish_weight = 0
-
-    weight_map = [
-        (direction_60m, 40),
-        (direction_15m, 40),
-        (direction_5m, 20),
-    ]
-
-    for direction, weight in weight_map:
-        if direction == "BUY CE":
-            bullish_weight += weight
-        elif direction == "BUY PE":
-            bearish_weight += weight
-
-    if bullish_weight > bearish_weight:
-        bias = "BULLISH — WATCH CE"
-        option_side = "CE"
-        trigger = resistance
-        invalidation = support
-    elif bearish_weight > bullish_weight:
-        bias = "BEARISH — WATCH PE"
-        option_side = "PE"
-        trigger = support
-        invalidation = resistance
-    else:
-        bias = "SIDEWAYS — NO TRADE"
-        option_side = "WAIT"
-        trigger = 0.0
-        invalidation = 0.0
-
-    return {
-        "Bias": bias,
-        "OptionSide": option_side,
-        "RecommendedStrike": atm_strike,
-        "Trigger": trigger,
-        "Invalidation": invalidation,
-        "BullishWeight": bullish_weight,
-        "BearishWeight": bearish_weight,
-    }
-
-
-def refined_option_plan(
-    direction,
-    option_type,
-    premium_entry,
-    premium_stop,
-    premium_target1,
-    premium_target2,
-    premium_target3,
-):
-    if direction not in {"BUY CE", "BUY PE"}:
-        return {
-            "Action": "WAIT",
-            "Option": "NO TRADE",
-            "Entry": 0.0,
-            "Stop": 0.0,
-            "Target1": 0.0,
-            "Target2": 0.0,
-            "Target3": 0.0,
-            "RiskReward": "N/A",
-        }
-
-    risk = max(premium_entry - premium_stop, 0.0)
-    reward = max(premium_target2 - premium_entry, 0.0)
-    rr = reward / risk if risk > 0 else 0.0
-
-    return {
-        "Action": direction,
-        "Option": option_type,
-        "Entry": premium_entry,
-        "Stop": premium_stop,
-        "Target1": premium_target1,
-        "Target2": premium_target2,
-        "Target3": premium_target3,
-        "RiskReward": f"1:{rr:.2f}" if rr > 0 else "N/A",
-    }
-
-
-# =========================================================
-# PAPER TRADING & BACKTESTING
-# =========================================================
-
-def open_paper_position(
-    index_name,
-    expiry,
-    option_type,
-    strike,
-    entry_price,
-    quantity,
-    stop_price,
-    target_price,
-):
-    if option_type not in {"CE", "PE"}:
-        return False, "No valid CE/PE signal available."
-
-    if entry_price <= 0 or quantity <= 0:
-        return False, "Entry price and quantity must be greater than zero."
-
-    estimated_cost = entry_price * quantity
-
-    if estimated_cost > st.session_state.paper_balance:
-        return False, "Insufficient paper-trading balance."
-
-    position = {
-        "ID": len(st.session_state.paper_positions) + len(
-            st.session_state.paper_trades
-        ) + 1,
-        "Opened": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-        "Index": index_name,
-        "Expiry": expiry,
-        "Option": option_type,
-        "Strike": float(strike),
-        "Entry": float(entry_price),
-        "Quantity": int(quantity),
-        "Stop": float(stop_price),
-        "Target": float(target_price),
-        "Status": "OPEN",
-    }
-
-    st.session_state.paper_balance -= estimated_cost
-    st.session_state.paper_positions.append(position)
-
-    return True, f"Paper position opened: {strike:.0f} {option_type}"
-
-
-def current_option_price(
-    option_dataframe,
-    strike,
-    option_type,
-):
-    matching = option_dataframe.loc[
-        option_dataframe["Strike"] == float(strike)
-    ]
-
-    if matching.empty:
-        return 0.0
-
-    row = matching.iloc[0]
-
-    if option_type == "CE":
-        return safe_float(row["CE LTP"])
-
-    if option_type == "PE":
-        return safe_float(row["PE LTP"])
-
-    return 0.0
-
-
-def close_paper_position(
-    position_id,
-    option_dataframe,
-    exit_reason="Manual Exit",
-):
-    positions = st.session_state.paper_positions
-
-    for position in positions:
-        if position["ID"] != position_id:
-            continue
-
-        exit_price = current_option_price(
-            option_dataframe,
-            position["Strike"],
-            position["Option"],
-        )
-
-        if exit_price <= 0:
-            return False, "Current option price is unavailable."
-
-        quantity = position["Quantity"]
-        entry_cost = position["Entry"] * quantity
-        exit_value = exit_price * quantity
-        pnl = exit_value - entry_cost
-
-        trade = dict(position)
-        trade.update(
-            {
-                "Closed": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-                "Exit": exit_price,
-                "PnL": pnl,
-                "Exit Reason": exit_reason,
-                "Status": "CLOSED",
-            }
-        )
-
-        st.session_state.paper_balance += exit_value
-        st.session_state.paper_trades.append(trade)
-        st.session_state.paper_positions = [
-            item for item in positions if item["ID"] != position_id
-        ]
-
-        return True, f"Position closed. Paper P&L: ₹{pnl:,.2f}"
-
-    return False, "Position was not found."
-
-
-def auto_manage_paper_positions(option_dataframe):
-    closed_messages = []
-
-    for position in list(st.session_state.paper_positions):
-        live_price = current_option_price(
-            option_dataframe,
-            position["Strike"],
-            position["Option"],
-        )
-
-        if live_price <= 0:
-            continue
-
-        if position["Stop"] > 0 and live_price <= position["Stop"]:
-            success, message = close_paper_position(
-                position["ID"],
-                option_dataframe,
-                "Stop Loss",
-            )
-            if success:
-                closed_messages.append(message)
-
-        elif position["Target"] > 0 and live_price >= position["Target"]:
-            success, message = close_paper_position(
-                position["ID"],
-                option_dataframe,
-                "Target",
-            )
-            if success:
-                closed_messages.append(message)
-
-    return closed_messages
-
-
-def paper_positions_dataframe(option_dataframe):
-    rows = []
-
-    for position in st.session_state.paper_positions:
-        live_price = current_option_price(
-            option_dataframe,
-            position["Strike"],
-            position["Option"],
-        )
-
-        pnl = (
-            (live_price - position["Entry"]) * position["Quantity"]
-            if live_price > 0
-            else 0.0
-        )
-
-        row = dict(position)
-        row["Live Price"] = live_price
-        row["Unrealized PnL"] = pnl
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def calculate_paper_statistics():
-    trades = pd.DataFrame(st.session_state.paper_trades)
-
-    if trades.empty:
-        return {
-            "Total Trades": 0,
-            "Winning Trades": 0,
-            "Losing Trades": 0,
-            "Win Rate": 0.0,
-            "Net PnL": 0.0,
-            "Average PnL": 0.0,
-        }
-
-    winning = int((trades["PnL"] > 0).sum())
-    losing = int((trades["PnL"] < 0).sum())
-    total = len(trades)
-
-    return {
-        "Total Trades": total,
-        "Winning Trades": winning,
-        "Losing Trades": losing,
-        "Win Rate": (winning / total * 100) if total else 0.0,
-        "Net PnL": safe_float(trades["PnL"].sum()),
-        "Average PnL": safe_float(trades["PnL"].mean()),
-    }
-
-
-def backtest_strategy(
-    candles,
-    initial_capital=100000.0,
-    risk_percent=1.0,
-):
-    if candles.empty or len(candles) < 40:
-        return pd.DataFrame(), {
-            "Initial Capital": initial_capital,
-            "Final Capital": initial_capital,
-            "Net PnL": 0.0,
-            "Total Trades": 0,
-            "Win Rate": 0.0,
-            "Max Drawdown": 0.0,
-        }
-
-    frame = candles.copy().reset_index(drop=True)
-    capital = float(initial_capital)
-    equity_curve = [capital]
-    trades = []
-    active_trade = None
-
-    for index in range(20, len(frame)):
-        row = frame.iloc[index]
-        previous = frame.iloc[index - 1]
-
-        close_price = safe_float(row["Close"])
-        atr_value = safe_float(row["ATR"])
-        rsi_value = safe_float(row["RSI"], 50.0)
-        vwap_value = safe_float(row["VWAP"])
-        trend_value = safe_int(row["TrendDirection"])
-
-        bullish_signal = (
-            trend_value == 1
-            and close_price > vwap_value
-            and rsi_value >= 55
-        )
-
-        bearish_signal = (
-            trend_value == -1
-            and close_price < vwap_value
-            and rsi_value <= 45
-        )
-
-        if active_trade is None:
-            if not atr_value:
-                equity_curve.append(capital)
-                continue
-
-            risk_amount = capital * risk_percent / 100
-
-            if bullish_signal:
-                stop = close_price - 1.5 * atr_value
-                target = close_price + 2.0 * atr_value
-                risk_per_unit = close_price - stop
-                quantity = max(1, int(risk_amount / max(risk_per_unit, 0.01)))
-
-                active_trade = {
-                    "Side": "LONG",
-                    "Entry Time": row["Datetime"],
-                    "Entry": close_price,
-                    "Stop": stop,
-                    "Target": target,
-                    "Quantity": quantity,
-                }
-
-            elif bearish_signal:
-                stop = close_price + 1.5 * atr_value
-                target = close_price - 2.0 * atr_value
-                risk_per_unit = stop - close_price
-                quantity = max(1, int(risk_amount / max(risk_per_unit, 0.01)))
-
-                active_trade = {
-                    "Side": "SHORT",
-                    "Entry Time": row["Datetime"],
-                    "Entry": close_price,
-                    "Stop": stop,
-                    "Target": target,
-                    "Quantity": quantity,
-                }
-
-        else:
-            exit_price = None
-            reason = None
-
-            if active_trade["Side"] == "LONG":
-                if safe_float(row["Low"]) <= active_trade["Stop"]:
-                    exit_price = active_trade["Stop"]
-                    reason = "Stop Loss"
-                elif safe_float(row["High"]) >= active_trade["Target"]:
-                    exit_price = active_trade["Target"]
-                    reason = "Target"
-                elif bearish_signal:
-                    exit_price = close_price
-                    reason = "Opposite Signal"
-
-                if exit_price is not None:
-                    pnl = (
-                        exit_price - active_trade["Entry"]
-                    ) * active_trade["Quantity"]
-
-            else:
-                if safe_float(row["High"]) >= active_trade["Stop"]:
-                    exit_price = active_trade["Stop"]
-                    reason = "Stop Loss"
-                elif safe_float(row["Low"]) <= active_trade["Target"]:
-                    exit_price = active_trade["Target"]
-                    reason = "Target"
-                elif bullish_signal:
-                    exit_price = close_price
-                    reason = "Opposite Signal"
-
-                if exit_price is not None:
-                    pnl = (
-                        active_trade["Entry"] - exit_price
-                    ) * active_trade["Quantity"]
-
-            if exit_price is not None:
-                capital += pnl
-
-                trades.append(
-                    {
-                        **active_trade,
-                        "Exit Time": row["Datetime"],
-                        "Exit": exit_price,
-                        "PnL": pnl,
-                        "Exit Reason": reason,
-                    }
-                )
-
-                active_trade = None
-
-        equity_curve.append(capital)
-
-    if active_trade is not None:
-        last_row = frame.iloc[-1]
-        exit_price = safe_float(last_row["Close"])
-
-        if active_trade["Side"] == "LONG":
-            pnl = (
-                exit_price - active_trade["Entry"]
-            ) * active_trade["Quantity"]
-        else:
-            pnl = (
-                active_trade["Entry"] - exit_price
-            ) * active_trade["Quantity"]
-
-        capital += pnl
-
-        trades.append(
-            {
-                **active_trade,
-                "Exit Time": last_row["Datetime"],
-                "Exit": exit_price,
-                "PnL": pnl,
-                "Exit Reason": "End of Data",
-            }
-        )
-
-    trade_frame = pd.DataFrame(trades)
-
-    equity_series = pd.Series(equity_curve, dtype="float64")
-    rolling_peak = equity_series.cummax()
-    drawdown = (
-        (equity_series - rolling_peak)
-        / rolling_peak.replace(0, pd.NA)
-        * 100
-    )
-
-    winning_trades = (
-        int((trade_frame["PnL"] > 0).sum())
-        if not trade_frame.empty
-        else 0
-    )
-
-    total_trades = len(trade_frame)
-
-    summary = {
-        "Initial Capital": initial_capital,
-        "Final Capital": capital,
-        "Net PnL": capital - initial_capital,
-        "Total Trades": total_trades,
-        "Win Rate": (
-            winning_trades / total_trades * 100
-            if total_trades
-            else 0.0
-        ),
-        "Max Drawdown": abs(safe_float(drawdown.min(), 0.0)),
-    }
-
-    return trade_frame, summary
-
-
-
-@st.cache_data(ttl=21600)
-def resolve_india_vix_security_id():
-    """
-    Resolve INDIA VIX from Dhan's official instrument master.
-
-    This avoids hard-coding a Security ID that may differ or change.
-    Returns an integer Security ID or None.
-    """
-    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-
-    try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-
-        decoded_lines = response.content.decode(
-            "utf-8-sig",
-            errors="ignore",
-        ).splitlines()
-
-        reader = csv.DictReader(decoded_lines)
-
-        for row in reader:
-            searchable = " | ".join(
-                str(value or "") for value in row.values()
-            ).upper()
-
-            if "INDIA VIX" not in searchable:
-                continue
-
-            security_key = next(
-                (
-                    key
-                    for key in row.keys()
-                    if key
-                    and "SECURITY" in key.upper()
-                    and "ID" in key.upper()
-                ),
-                None,
-            )
-
-            if not security_key:
-                continue
-
-            security_id = safe_int(row.get(security_key), 0)
-
-            if security_id > 0:
-                return security_id
-
-    except Exception:
-        return None
-
-    return None
-
-
-def fetch_india_vix():
-    """
-    Fetch INDIA VIX independently.
-
-    A VIX lookup failure never breaks the main dashboard or index cards.
-    """
-    if not CREDENTIALS_READY or dhan is None:
-        return 0.0, "API not connected"
-
-    security_id = resolve_india_vix_security_id()
-
-    if not security_id:
-        return 0.0, "Instrument unavailable"
-
-    try:
-        result = dhan.ticker_data({"IDX_I": [security_id]})
-
-        if result.get("status") != "success":
-            return 0.0, "Data unavailable"
-
-        market_data = result.get("data", {}).get("data", {})
-        segment_data = market_data.get("IDX_I", {})
-
-        row = segment_data.get(
-            str(security_id),
-            segment_data.get(security_id, {}),
-        )
-
-        value = safe_float(row.get("last_price"))
-
-        if value <= 0:
-            return 0.0, "Data unavailable"
-
-        if value < 13:
-            state = "Low volatility"
-        elif value < 20:
-            state = "Normal volatility"
-        elif value < 30:
-            state = "High volatility"
-        else:
-            state = "Extreme volatility"
-
-        return value, state
-
-    except Exception:
-        return 0.0, "Data unavailable"
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def load_dhan_instrument_master():
-    """Load Dhan's official instrument master for dynamic MCX resolution."""
-    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-    try:
-        response = requests.get(url, timeout=25)
-        response.raise_for_status()
-        text = response.content.decode("utf-8-sig", errors="ignore")
-        return list(csv.DictReader(text.splitlines()))
-    except Exception as error:
-        add_api_log(f"Instrument master unavailable: {error}", "WARNING")
-        return []
-
-
-def _row_value(row, *keywords):
-    for key, value in row.items():
-        normalized = str(key or "").upper().replace("_", " ")
-        if all(word.upper() in normalized for word in keywords):
-            return value
-    return None
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def resolve_nearest_mcx_future(symbol):
-    """Resolve the nearest non-expired standard MCX future without hard-coded IDs."""
-    symbol = str(symbol).upper().strip()
-    today = datetime.now(IST).date()
-    candidates = []
-
-    for row in load_dhan_instrument_master():
-        searchable = " | ".join(str(value or "") for value in row.values()).upper()
-        if "MCX" not in searchable or "FUT" not in searchable:
-            continue
-
-        trading_symbol = str(
-            _row_value(row, "TRADING", "SYMBOL")
-            or _row_value(row, "DISPLAY", "NAME")
-            or _row_value(row, "SYMBOL")
-            or ""
-        ).upper().strip()
-
-        # Prefer standard GOLD and CRUDEOIL contracts, not mini variants.
-        if not trading_symbol.startswith(symbol):
-            continue
-        if symbol == "GOLD" and trading_symbol.startswith(("GOLDM", "GOLDTEN", "GOLDPETAL", "GOLDGUINEA")):
-            continue
-        if symbol == "CRUDEOIL" and trading_symbol.startswith("CRUDEOILM"):
-            continue
-
-        security_id = safe_int(_row_value(row, "SECURITY", "ID"), 0)
-        if security_id <= 0:
-            continue
-
-        expiry_raw = (
-            _row_value(row, "EXPIRY", "DATE")
-            or _row_value(row, "EXPIRY")
-            or ""
-        )
-        expiry = pd.to_datetime(expiry_raw, errors="coerce", dayfirst=True)
-        if pd.isna(expiry):
-            continue
-        expiry_date = expiry.date()
-        if expiry_date < today:
-            continue
-
-        exchange_segment = str(
-            _row_value(row, "EXCHANGE", "SEGMENT") or "MCX_COMM"
-        ).strip() or "MCX_COMM"
-        if "MCX" in exchange_segment.upper():
-            exchange_segment = "MCX_COMM"
-
-        candidates.append({
-            "security_id": security_id,
-            "segment": exchange_segment,
-            "trading_symbol": trading_symbol,
-            "expiry": expiry_date.isoformat(),
-        })
-
-    return min(candidates, key=lambda item: item["expiry"]) if candidates else None
-
-
-def fetch_mcx_future_quote(symbol):
-    if not CREDENTIALS_READY:
-        return None, "Dhan API not connected"
-
-    contract = resolve_nearest_mcx_future(symbol)
-    if not contract:
-        return None, "Active MCX contract not resolved"
-
-    parsed, error = direct_marketfeed_ltp(
-        {contract["segment"]: [contract["security_id"]]},
-        attempts=3,
-    )
-    row = parsed.get((contract["segment"], str(contract["security_id"])))
-    if not row:
-        return None, error or "Quote unavailable"
-
-    return {
-        "last_price": safe_float(row.get("last_price")),
-        "symbol": contract["trading_symbol"],
-        "expiry": contract["expiry"],
-        "source": "Dhan MCX",
-    }, ""
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_crypto_inr(coin_id, symbol):
-    """Fetch public crypto spot price in INR; no dummy fallback."""
-    url = (
-        "https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={coin_id}&vs_currencies=inr&include_24hr_change=true"
-    )
-    try:
-        response = request_with_retry("GET", url, timeout=12, attempts=2)
-        payload = response.json().get(coin_id, {})
-        price = safe_float(payload.get("inr"))
-        change = safe_float(payload.get("inr_24h_change"))
-        if price <= 0:
-            return None, f"{symbol}/INR unavailable"
-        return {
-            "last_price": price,
-            "change_24h": change,
-            "symbol": f"{symbol}/INR",
-            "source": "CoinGecko spot",
-            "asset_type": "CRYPTO",
-        }, ""
-    except Exception as error:
-        return None, str(error)
-
-
-def fetch_cross_market_quotes():
-    """Fetch major MCX futures and BTC/ETH spot independently."""
-    results = {}
-    failures = []
-
-    commodity_map = [
-        ("GOLD", "GOLD"),
-        ("SILVER", "SILVER"),
-        ("CRUDE OIL", "CRUDEOIL"),
-        ("NATURAL GAS", "NATURALGAS"),
-    ]
-
-    for label, symbol in commodity_map:
-        quote, error = fetch_mcx_future_quote(symbol)
-        if quote:
-            quote["asset_type"] = "COMMODITY"
-            quote["root_symbol"] = symbol
-            results[label] = quote
-        else:
-            failures.append(f"{label}: {error}")
-        time.sleep(1.05)
-
-    for label, coin_id, symbol in [
-        ("BITCOIN", "bitcoin", "BTC"),
-        ("ETHEREUM", "ethereum", "ETH"),
-    ]:
-        quote, error = fetch_crypto_inr(coin_id, symbol)
-        if quote:
-            results[label] = quote
-        else:
-            failures.append(f"{label}: {error}")
-
-    return results, failures
-
-
-def commodity_chain_dataframe(chain_response):
-    """Convert a Dhan MCX option-chain response into a compact table."""
-    data = chain_response.get("data", {}) if isinstance(chain_response, dict) else {}
-    spot = safe_float(data.get("last_price"))
-    rows = []
-    for strike_text, option_data in (data.get("oc", {}) or {}).items():
-        ce = (option_data or {}).get("ce") or {}
-        pe = (option_data or {}).get("pe") or {}
-        ce_oi = safe_int(ce.get("oi"))
-        pe_oi = safe_int(pe.get("oi"))
-        rows.append({
-            "CE OI": ce_oi,
-            "CE Chg OI": ce_oi - safe_int(ce.get("previous_oi")),
-            "CE Volume": safe_int(ce.get("volume")),
-            "CE IV": safe_float(ce.get("implied_volatility")),
-            "CE LTP": safe_float(ce.get("last_price")),
-            "Strike": safe_float(strike_text),
-            "PE LTP": safe_float(pe.get("last_price")),
-            "PE IV": safe_float(pe.get("implied_volatility")),
-            "PE Volume": safe_int(pe.get("volume")),
-            "PE Chg OI": pe_oi - safe_int(pe.get("previous_oi")),
-            "PE OI": pe_oi,
-        })
-    frame = pd.DataFrame(rows)
-    if frame.empty:
-        return frame, spot, 0.0, 0.0, 0.0
-    frame = frame.sort_values("Strike").reset_index(drop=True)
-    atm = safe_float(frame.loc[(frame["Strike"] - spot).abs().idxmin(), "Strike"])
-    resistance = safe_float(frame.loc[frame["CE OI"].idxmax(), "Strike"])
-    support = safe_float(frame.loc[frame["PE OI"].idxmax(), "Strike"])
-    return frame, spot, atm, resistance, support
-
-
-# =========================================================
-# HEADER AND SIDEBAR
-# =========================================================
-
-vix_value, vix_state = fetch_india_vix()
-vix_display = f"{vix_value:.2f}" if vix_value > 0 else "N/A"
+    if expiry_result.ok:
+        expiries = parse_expiries(expiry_result.data)
+
+# ---------------------------------------------------------------------
+# HEADER
+# ---------------------------------------------------------------------
+market_open, market_label = is_market_open()
+connection_label = "Dhan Connected" if connection.ok else "Dhan Not Connected"
+connection_class = "good" if connection.ok else "warn"
+market_class = "good" if market_open else "bad"
 
 st.markdown(
     f"""
-    <div class="terminal-header">
-        <div class="terminal-header-left">
-            <div class="terminal-header-title">
-                Shankar Trading Dashboard
-            </div>
-            <div class="terminal-header-subtitle">
-                NSE • BSE • NIFTY • BANK NIFTY • Option Chain • OI • PCR • Max Pain •
-                Pivot Points • SMC • Paper Trading • Backtesting
-            </div>
-        </div>
-        <div class="vix-badge">
-            <div class="vix-label">INDIA VIX</div>
-            <div class="vix-value">{vix_display}</div>
-            <div class="vix-state">{vix_state}</div>
-        </div>
-    </div>
-    """,
+<div class="hero">
+  <div class="hero-title">📈 {APP_NAME}</div>
+  <div class="hero-sub">5-minute Entry / Exit / SL / Targets • 15-minute Trend Confirmation only • Live Multi-Index Option Terminal</div>
+</div>
+<div class="status-strip">
+  <div class="status-pill {market_class}">● {market_label}</div>
+  <div class="status-pill {connection_class}">● {connection_label}</div>
+  <div class="status-pill">🕒 {now_ist_text()}</div>
+  <div class="status-pill">⚡ Fast-load mode</div>
+</div>
+""",
     unsafe_allow_html=True,
 )
 
-is_market_open, now_ist, market_note = market_status()
-
-st.markdown(
-    f'<div class="{"status-open" if is_market_open else "status-closed"}">'
-    f'{market_note} IST time: {now_ist.strftime("%d-%m-%Y %I:%M:%S %p")}'
-    f'</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="terminal-strip">
-        <div class="terminal-pill">5m Entry Engine</div>
-        <div class="terminal-pill">15m Trend Confirmation</div>
-        <div class="terminal-pill">5m + 15m + 60m Confirmation</div>
-        <div class="terminal-pill">OI + PCR + Max Pain</div>
-        <div class="terminal-pill">Options SMC + FVG + Liquidity</div>
-        <div class="terminal-pill">Options Paper Trading + Backtest</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-with st.sidebar:
-    st.header("⚙️ Dashboard Controls")
-
-    auto_refresh = st.toggle(
-        "Auto refresh every 10 seconds",
-        value=False,
-    )
-
-    sound_alert = st.toggle(
-        "Sound on new CE/PE signal",
-        value=True,
-    )
-
-    show_api_debug = st.toggle(
-        "Show hidden API logger",
-        value=False,
-        help="Displays recent API attempts and parser messages.",
-    )
-
-    st.info(
-        "The terminal automatically uses 5-minute candles for entries and "
-        "15-minute candles for trend confirmation."
-    )
-
-    chart_interval = "5"
-
-    st.divider()
-
-    st.subheader("💰 Risk Calculator")
-
-    trading_capital = st.number_input(
-        "Trading capital (₹)",
-        min_value=1000.0,
-        value=15000.0,
-        step=1000.0,
-    )
-
-    risk_percent = st.number_input(
-        "Risk per trade (%)",
-        min_value=0.25,
-        max_value=5.0,
-        value=1.0,
-        step=0.25,
-    )
-
-    lot_size = st.number_input(
-        "Current lot size",
-        min_value=1,
-        value=75,
-        step=1,
-        help="Enter the current exchange lot size manually.",
-    )
-
-    st.caption(
-        "Lot sizes and exchange rules can change. Keep this value updated."
-    )
-
-    st.divider()
-
-    st.subheader("🧪 Paper Trading")
-
-    paper_starting_balance = st.number_input(
-        "Paper account balance (₹)",
-        min_value=10000.0,
-        value=float(st.session_state.paper_balance),
-        step=10000.0,
-    )
-
-    if st.button("Reset Paper Account"):
-        st.session_state.paper_balance = paper_starting_balance
-        st.session_state.paper_positions = []
-        st.session_state.paper_trades = []
-        st.success("Paper account reset.")
-
-    st.divider()
-
-    if st.button("Clear signal history"):
-        st.session_state.signal_log = []
-        st.success("Signal history cleared.")
-
-if not CREDENTIALS_READY:
-    st.error(
-        "Dhan Client ID and Access Token are missing. "
-        "Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in environment variables "
-        "or .streamlit/secrets.toml, then restart the app."
-    )
-    st.stop()
-
-connection_columns = st.columns(4)
-
-connection_columns[0].metric(
-    "API Connection",
-    "Ready" if CREDENTIALS_READY else "Missing credentials",
-)
-connection_columns[1].metric(
-    "INDIA VIX",
-    vix_display,
-)
-connection_columns[2].metric(
-    "VIX Status",
-    vix_state,
-)
-connection_columns[3].metric(
-    "Market Status",
-    professional_market_status()[3],
-)
-
-if st.button("🔄 Refresh Dashboard", width="stretch"):
-    st.rerun()
-
-
-# =========================================================
-# LIVE MARKET DATA
-# =========================================================
-
-with st.spinner("Loading live index prices..."):
-    live_quotes, live_failures = fetch_professional_index_quotes()
-
-if live_quotes:
-    st.session_state.last_market_quotes = live_quotes
-
-    st.success(
-        f"✅ {len(live_quotes)} live index prices connected"
-    )
-    st.subheader("📡 Live Index Monitor")
-
-    live_cards = []
-
-    for instrument_name in [
-        "NIFTY 50",
-        "BANK NIFTY",
-        "FIN NIFTY",
-        "MIDCAP NIFTY",
-        "SENSEX",
-        "BANKEX",
-    ]:
-        quote = live_quotes.get(instrument_name)
-
-        if not quote:
-            continue
-
-        last_price = safe_float(quote.get("last_price"))
-
-        live_cards.append(
-            f"""
-            <div class="live-card index-card">
-                <div class="live-card-title">{instrument_name}</div>
-                <div class="live-card-value">₹ {last_price:,.2f}</div>
-            </div>
-            """
+# Real clickable index selector. V9 used decorative HTML chips, which could never
+# change the selected market. Button callbacks update Session State before rerun.
+market_names = list(AVAILABLE_MARKETS.keys())
+market_cols = st.columns(len(market_names))
+for col, name in zip(market_cols, market_names):
+    with col:
+        st.button(
+            name,
+            key=f"market_btn_{name}",
+            type="primary" if name == selected_market else "secondary",
+            use_container_width=True,
+            on_click=select_market_from_button,
+            args=(name,),
         )
 
-    render_html(
-        '<div class="live-grid">' + "".join(live_cards) + "</div>"
+if st.session_state.last_validation_message:
+    if connection.ok and st.session_state.live_enabled:
+        st.success(st.session_state.last_validation_message)
+    elif validate_clicked:
+        st.error(st.session_state.last_validation_message)
+
+if should_check_connection and not connection.ok:
+    error_kind = classify_api_error(connection)
+    if error_kind == "TOKEN_EXPIRED":
+        st.error("🔑 Dhan Access Token expired — generate and paste a new token.")
+    elif error_kind == "AUTH_ERROR":
+        st.error("🔐 Authentication failed — check Client ID and Access Token.")
+    elif error_kind == "DATA_SUBSCRIPTION":
+        st.error("📡 Dhan Data API subscription/access is unavailable for this account.")
+    elif error_kind == "RATE_LIMIT":
+        st.warning("⏳ Dhan API rate limit reached — wait a few seconds before refreshing.")
+
+# Expiry selector appears in main area, avoiding a blank top-right box.
+selector_col1, selector_col2, selector_col3 = st.columns([2.2, 1.5, 1])
+with selector_col1:
+    st.markdown(f"### {selected_market}")
+    st.caption(f"Security ID: {security_id} • Segment: {market_info['segment']} • {market_info.get('master_symbol', 'Index')}")
+with selector_col2:
+    selected_expiry = st.selectbox(
+        "Expiry",
+        options=expiries if expiries else ["Expiry not loaded — see API Log"],
+        disabled=not bool(expiries),
+    )
+with selector_col3:
+    st.markdown("### Data Status")
+    st.caption("LIVE DATA ON" if load_live else "OFFLINE — CLICK CONNECT LIVE")
+
+if load_live and not expiries:
+    detail = expiry_result.message or "Unknown expiry-list error"
+    st.error(
+        "Dhan account is connected, but expiry data did not load. "
+        f"API response: {detail}. Open the API Log tab for HTTP details."
     )
 
+chain_result = ApiResult(False, message="Not loaded")
+df_chain = pd.DataFrame()
+spot = None
+df5 = pd.DataFrame()
+df15 = pd.DataFrame()
+
+if load_live and expiries:
+    chain_result = fetch_option_chain(
+        client_id.strip(),
+        access_token.strip(),
+        security_id,
+        market_info["segment"],
+        selected_expiry,
+    )
+    if chain_result.ok:
+        df_chain, spot = parse_option_chain(chain_result.data)
+
+    result5 = fetch_intraday(
+        client_id.strip(),
+        access_token.strip(),
+        security_id,
+        market_info["chart_segment"],
+        market_info["instrument"],
+        "5",
+    )
+    result15 = fetch_intraday(
+        client_id.strip(),
+        access_token.strip(),
+        security_id,
+        market_info["chart_segment"],
+        market_info["instrument"],
+        "15",
+    )
+    if result5.ok:
+        df5 = add_indicators(parse_candles(result5.data))
+    if result15.ok:
+        df15 = add_indicators(parse_candles(result15.data))
 else:
-    previous_quotes = st.session_state.get(
-        "last_market_quotes",
-        {},
+    result5 = ApiResult(False, message="Live load disabled")
+    result15 = ApiResult(False, message="Live load disabled")
+
+vix_result = ApiResult(False, message="VIX disabled")
+india_vix = np.nan
+if load_live and india_vix_security_id > 0:
+    vix_result = fetch_ltp(
+        client_id.strip(),
+        access_token.strip(),
+        india_vix_security_id,
+        discovered_indices.get("INDIA VIX", {}).get("segment", "IDX_I"),
+    )
+    if vix_result.ok:
+        india_vix = parse_ltp(vix_result.data, india_vix_security_id)
+
+sig5 = timeframe_signal(df5)
+sig15 = timeframe_signal(df15)
+metrics = option_metrics(df_chain, spot)
+flow = option_flow_intelligence(df_chain, spot, metrics)
+oi_levels = option_oi_levels(df_chain)
+decision = final_decision(sig5, sig15, metrics)
+# V10.3 confirmation veto: strong opposite option-flow prevents a fresh BUY setup.
+if decision["action"].startswith("BUY CE") and flow["flow_score"] <= 38:
+    decision.update({"action": "WAIT — OPTION FLOW CONFLICT", "css": "", "reason": "Technical setup is bullish, but option-chain flow is strongly bearish."})
+elif decision["action"].startswith("BUY PE") and flow["flow_score"] >= 62:
+    decision.update({"action": "WAIT — OPTION FLOW CONFLICT", "css": "", "reason": "Technical setup is bearish, but option-chain flow is strongly bullish."})
+pivots = calculate_pivots(df15 if not df15.empty else df5)
+liquidity = liquidity_filter(df_chain, metrics)
+backtest = simple_backtest(df5, df15)
+trade_plan = build_trade_plan(decision, df_chain, metrics, sig5)
+
+if trade_plan["side"] != "WAIT" and not liquidity["ok"]:
+    trade_plan["side"] = "WAIT"
+    trade_plan["note"] = liquidity["reason"] + ". Trade blocked by V10.3 liquidity/data-quality filter."
+
+if not market_open and decision["action"].startswith("BUY"):
+    decision["action"] = "MARKET CLOSED — LAST DATA ONLY"
+    decision["css"] = ""
+    decision["reason"] = "Signals are historical snapshots. New live entry is disabled outside market hours."
+
+# ---------------------------------------------------------------------
+# V10.3 PRO TERMINAL SUMMARY — ONLY 5m EXECUTION + 15m TREND
+# ---------------------------------------------------------------------
+aligned = sig5["trend"] == sig15["trend"] and sig5["trend"] in ("Bullish", "Bearish")
+alignment_text = sig5["trend"] if aligned else "Mixed"
+alignment_class = "pro-green" if alignment_text == "Bullish" else "pro-red" if alignment_text == "Bearish" else "pro-amber"
+final_class = "pro-green" if "BUY CE" in decision["action"] else "pro-red" if "BUY PE" in decision["action"] else "pro-amber"
+vix_text = fmt_num(india_vix, 2) if math.isfinite(safe_float(india_vix, np.nan)) else "—"
+
+st.markdown(
+    f"""
+<div class="pro-summary">
+  <div class="pro-card {'pro-green' if sig5['trend']=='Bullish' else 'pro-red' if sig5['trend']=='Bearish' else 'pro-amber'}"><div class="k">5-Minute Execution</div><div class="v">{sig5['trend']}</div><div class="s">Entry/Exit/SL/Targets • Score {sig5['score']}%</div></div>
+  <div class="pro-card {'pro-green' if sig15['trend']=='Bullish' else 'pro-red' if sig15['trend']=='Bearish' else 'pro-amber'}"><div class="k">15-Minute Trend Only</div><div class="v">{sig15['trend']}</div><div class="s">Trend confirmation only • RSI {fmt_num(sig15['rsi'],1)}</div></div>
+  <div class="pro-card {alignment_class}"><div class="k">Trend Alignment</div><div class="v">{alignment_text}</div><div class="s">5m execution + 15m trend</div></div>
+  <div class="pro-card pro-cyan"><div class="k">AI Confidence</div><div class="v">{decision['confidence']}%</div><div class="s">80%+ setup • 70–79 wait • below 70 no trade</div></div>
+  <div class="pro-card {final_class}"><div class="k">Final Bias</div><div class="v">{decision['action']}</div><div class="s">{decision['reason']}</div></div>
+  <div class="pro-card pro-cyan"><div class="k">India VIX</div><div class="v">{vix_text}</div><div class="s">PCR {fmt_num(metrics['pcr'],2)} • Flow {flow['flow_bias']} {flow['flow_score']}%</div></div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown(
+    f"""
+<div class="level-strip2">
+ <div class="level2 lv-s"><div class="k">SUPPORT 1</div><div class="v">{fmt_num(oi_levels['support1'],0)}</div></div>
+ <div class="level2 lv-s"><div class="k">SUPPORT 2</div><div class="v">{fmt_num(oi_levels['support2'],0)}</div></div>
+ <div class="level2 lv-p"><div class="k">PIVOT</div><div class="v">{fmt_num(pivots['P'],0)}</div></div>
+ <div class="level2 lv-r"><div class="k">RESISTANCE 1</div><div class="v">{fmt_num(oi_levels['resistance1'],0)}</div></div>
+ <div class="level2 lv-r"><div class="k">RESISTANCE 2</div><div class="v">{fmt_num(oi_levels['resistance2'],0)}</div></div>
+ <div class="level2 lv-x"><div class="k">SPOT</div><div class="v">{fmt_num(spot,2)}</div></div>
+ <div class="level2 lv-p"><div class="k">ATM</div><div class="v">{fmt_num(metrics['atm'],0)}</div></div>
+</div>
+""", unsafe_allow_html=True)
+
+# Entry/SL/Targets are calculated strictly from 5-minute ATR and live option premium.
+if trade_plan["side"] != "WAIT":
+    st.markdown(f"""
+<div class="trade-strip">
+ <div class="trade-mini"><div class="k">CONTRACT</div><div class="v">{trade_plan['strike']:.0f} {trade_plan['side']}</div></div>
+ <div class="trade-mini trade-entry"><div class="k">5m ENTRY</div><div class="v">₹{trade_plan['entry']:.2f}</div></div>
+ <div class="trade-mini trade-sl"><div class="k">5m STOP-LOSS</div><div class="v">₹{trade_plan['sl']:.2f}</div></div>
+ <div class="trade-mini trade-target"><div class="k">TARGET 1</div><div class="v">₹{trade_plan['t1']:.2f}</div></div>
+ <div class="trade-mini trade-target"><div class="k">TARGET 2</div><div class="v">₹{trade_plan['t2']:.2f}</div></div>
+ <div class="trade-mini trade-target"><div class="k">TARGET 3</div><div class="v">₹{trade_plan['t3']:.2f}</div></div>
+</div>
+""", unsafe_allow_html=True)
+else:
+    st.markdown(f'<div class="note-box"><b>5m Trade Plan:</b> WAIT — {trade_plan["note"]} &nbsp; <b>15m is used only for trend confirmation.</b></div>', unsafe_allow_html=True)
+
+st.markdown(
+    f"""
+<div class="note-box"><b>V10.3 Option Intelligence:</b> Flow <b>{flow['flow_bias']} ({flow['flow_score']}%)</b> • ATM Straddle <b>₹{fmt_num(flow['atm_straddle'],2)}</b> • Premium-implied move <b>{fmt_num(flow['expected_move_pct'],2)}%</b> • Put Vol {compact_num(flow['put_volume'])} vs Call Vol {compact_num(flow['call_volume'])}. Contract selection now ranks near-ATM strikes by spread, volume, OI, Delta and IV.</div>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------
+# TABS
+# ---------------------------------------------------------------------
+overview_tab, trade_tab, chart_tab, chain_tab, backtest_tab, risk_tab, log_tab = st.tabs(
+    ["🏠 Overview", "🎯 Trade Plan", "📊 5m & 15m Charts", "⛓ Option Chain", "🧪 Backtest", "🛡 Risk Calculator", "🧾 API Log"]
+)
+
+with overview_tab:
+    st.markdown("### 🌈 Key Levels")
+    st.markdown(
+        f"""
+<div class="level-grid">
+{colorful_level_card("SPOT PRICE", fmt_num(spot, 2), "Current underlying value", "📍", "spot-card")}
+{colorful_level_card("ATM STRIKE", fmt_num(metrics["atm"], 0), "Nearest active strike", "🎯", "atm-card")}
+{colorful_level_card("SUPPORT", fmt_num(metrics["support"], 0), "Highest Put OI", "🛡️", "support-card")}
+{colorful_level_card("RESISTANCE", fmt_num(metrics["resistance"], 0), "Highest Call OI", "🚧", "resistance-card")}
+{colorful_level_card("MAX PAIN", fmt_num(metrics["max_pain"], 0), "OI-based settlement zone", "🧲", "maxpain-card")}
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
-    if previous_quotes:
-        st.warning(
-            "Live index refresh is temporarily unavailable. "
-            "The last successfully received values are retained."
+    st.markdown("### 🎨 Previous-Day Levels & Classic Pivots")
+    st.markdown(
+        f"""
+<div class="pivot-grid">
+{pivot_level_card("PREVIOUS HIGH", fmt_num(pivots["PDH"], 2), "pivot-high")}
+{pivot_level_card("PIVOT", fmt_num(pivots["P"], 2), "pivot-main")}
+{pivot_level_card("PREVIOUS LOW", fmt_num(pivots["PDL"], 2), "pivot-low")}
+{pivot_level_card("PREVIOUS CLOSE", fmt_num(pivots["PDC"], 2), "pivot-close")}
+{pivot_level_card("S1", fmt_num(pivots["S1"], 2), "support-level")}
+{pivot_level_card("S2", fmt_num(pivots["S2"], 2), "support-level")}
+{pivot_level_card("S3", fmt_num(pivots["S3"], 2), "support-level")}
+{pivot_level_card("R1", fmt_num(pivots["R1"], 2), "resistance-level")}
+{pivot_level_card("R2", fmt_num(pivots["R2"], 2), "resistance-level")}
+{pivot_level_card("R3", fmt_num(pivots["R3"], 2), "resistance-level")}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### 💧 Liquidity Gate")
+    liquidity_status = "PASS" if liquidity["ok"] else "BLOCK"
+    status_icon = "✅" if liquidity["ok"] else "⛔"
+    st.markdown(
+        f"""
+<div class="liquidity-panel">
+  <div class="liquidity-grid">
+    <div class="liquidity-item">
+      <div class="liquidity-label">STATUS</div>
+      <div class="liquidity-value">{status_icon} {liquidity_status}</div>
+    </div>
+    <div class="liquidity-item">
+      <div class="liquidity-label">BEST SPREAD</div>
+      <div class="liquidity-value">{fmt_num(liquidity["spread_pct"], 2)}%</div>
+    </div>
+    <div class="liquidity-item">
+      <div class="liquidity-label">VOLUME</div>
+      <div class="liquidity-value">{compact_num(liquidity["volume"])}</div>
+    </div>
+    <div class="liquidity-item">
+      <div class="liquidity-label">OPEN INTEREST</div>
+      <div class="liquidity-value">{compact_num(liquidity["oi"])}</div>
+    </div>
+  </div>
+  <div class="level-sub" style="margin-top:12px;">{liquidity["reason"]}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### Signal Checklist")
+    trend5_class = "signal-bull" if sig5["trend"] == "Bullish" else "signal-bear" if sig5["trend"] == "Bearish" else "signal-gold"
+    trend15_class = "signal-bull" if sig15["trend"] == "Bullish" else "signal-bear" if sig15["trend"] == "Bearish" else "signal-gold"
+    st.markdown(
+        f"""
+<div class="signal-grid">
+{signal_card_html("5-MINUTE TREND", sig5["trend"], f'Entry score {sig5["score"]}%', sig5["score"], trend5_class)}
+{signal_card_html("5-MINUTE VWAP", fmt_num(sig5["vwap"], 2), "Price relationship filter", sig5["score"], "signal-blue")}
+{signal_card_html("5-MINUTE SUPERTREND", sig5["supertrend"], "Primary entry direction", sig5["score"], "signal-purple")}
+{signal_card_html("15-MINUTE TREND", sig15["trend"], f'Confirmation score {sig15["score"]}%', sig15["score"], trend15_class)}
+{signal_card_html("15-MINUTE SUPERTREND", sig15["supertrend"], "Higher-timeframe confirmation", sig15["score"], "signal-gold")}
+{signal_card_html("OPTION PCR", fmt_num(metrics["pcr"], 2), f'Sentiment score {metrics["sentiment_score"]}%', metrics["sentiment_score"], "signal-orange")}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+<div class="note-box">
+<b>Decision rules:</b> 80% and above = eligible BUY CE/BUY PE setup;
+70–79% = WAIT for confirmation; below 70% = NO TRADE.
+A signal is blocked when 5-minute and 15-minute trends do not agree.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+with trade_tab:
+    st.markdown("### Indicative Entry, Stop-Loss & Targets")
+    if trade_plan["side"] == "WAIT":
+        st.warning(trade_plan["note"])
+        st.markdown(
+            """
+<div class="note-box">
+The dashboard intentionally blocks a trade when 5-minute and 15-minute signals disagree,
+when confidence is below 80%, or when live premium data is unavailable.
+</div>
+""",
+            unsafe_allow_html=True,
         )
-
-        live_cards = []
-
-        for instrument_name, quote in previous_quotes.items():
-            last_price = safe_float(quote.get("last_price"))
-
-            live_cards.append(
-                f"""
-                <div class="live-card">
-                    <div class="live-card-title">
-                        {instrument_name} • Last received
-                    </div>
-                    <div class="live-card-value">
-                        ₹ {last_price:,.2f}
-                    </div>
-                </div>
-                """
-            )
-
-        render_html(
-            '<div class="live-grid">' + "".join(live_cards) + "</div>"
-        )
-
     else:
-        st.warning(
-            "Live index feed is temporarily unavailable. "
-            "No dummy prices are being displayed. "
-            "Option analysis can still be loaded separately."
+        side_text = f"{trade_plan['strike']:.0f} {trade_plan['side']}"
+        st.markdown(
+            f"""
+<div class="trade-plan">
+  <div class="small">SELECTED ATM CONTRACT</div>
+  <div class="big">{side_text}</div>
+  <div class="small">{trade_plan['note']}</div>
+</div>
+""",
+            unsafe_allow_html=True,
         )
-
-if live_failures:
-    add_api_log(
-        "Partial index-feed failures: "
-        + " | ".join(live_failures),
-        "WARNING",
-    )
-
-# Commodity & Crypto section moved to a separate dashboard.
-
-status_columns = st.columns(4)
-
-status_columns[0].metric(
-    "Dhan API",
-    "Connected" if CREDENTIALS_READY else "Disconnected",
-)
-status_columns[1].metric(
-    "INDIA VIX",
-    f"{vix_value:.2f}" if vix_value > 0 else "N/A",
-)
-status_columns[2].metric(
-    "Volatility State",
-    vix_state,
-)
-status_columns[3].metric(
-    "Market",
-    professional_market_status()[3],
-)
-
-if show_api_debug:
-    with st.expander("🛠 Hidden API Logger", expanded=False):
-        logs = pd.DataFrame(st.session_state.get("api_logs", []))
-
-        if logs.empty:
-            st.info("No API log entries yet.")
-        else:
-            st.dataframe(
-                logs.iloc[::-1],
-                width="stretch",
-                hide_index=True,
-            )
-
-
-
-st.subheader("📅 Market Holidays & Trading Days")
-render_market_calendar(now_ist.date())
-
-st.divider()
-
-
-# =========================================================
-# INDEX AND EXPIRY
-# =========================================================
-
-st.subheader("📈 Full Option & Technical Analysis")
-
-index_choice = st.selectbox(
-    "Select Index",
-    [
-        "NIFTY 50",
-        "BANK NIFTY",
-        "FIN NIFTY",
-        "MIDCAP NIFTY",
-        "SENSEX",
-        "BANKEX",
-    ],
-)
-
-index_details = {
-    "NIFTY 50": {
-        "security_id": 13,
-        "segment": "IDX_I",
-        "instrument": "INDEX",
-        "alert_buffer": 10,
-    },
-    "BANK NIFTY": {
-        "security_id": 25,
-        "segment": "IDX_I",
-        "instrument": "INDEX",
-        "alert_buffer": 25,
-    },
-    "FIN NIFTY": {
-        "security_id": 27,
-        "segment": "IDX_I",
-        "instrument": "INDEX",
-        "alert_buffer": 10,
-    },
-    "MIDCAP NIFTY": {
-        "security_id": 442,
-        "segment": "IDX_I",
-        "instrument": "INDEX",
-        "alert_buffer": 10,
-    },
-    "SENSEX": {
-        "security_id": 51,
-        "segment": "IDX_I",
-        "instrument": "INDEX",
-        "alert_buffer": 25,
-    },
-    "BANKEX": {
-        "security_id": 69,
-        "segment": "IDX_I",
-        "instrument": "INDEX",
-        "alert_buffer": 25,
-    },
-}
-
-selected_index = index_details[index_choice]
-
-try:
-    expiry_response = get_expiry_list(
-        selected_index["security_id"],
-        selected_index["segment"],
-        CLIENT_ID,
-        ACCESS_TOKEN,
-    )
-
-    if expiry_response.get("status") != "success":
+        t1, t2, t3, t4, t5, t6 = st.columns(6)
+        t1.metric("Entry", f"₹{trade_plan['entry']:.2f}")
+        t2.metric("Stop-Loss", f"₹{trade_plan['sl']:.2f}")
+        t3.metric("Target 1", f"₹{trade_plan['t1']:.2f}")
+        t4.metric("Target 2", f"₹{trade_plan['t2']:.2f}")
+        t5.metric("Target 3", f"₹{trade_plan['t3']:.2f}")
+        t6.metric("Max R:R", trade_plan["rr"])
         st.error(
-            "Expiry API failed. Check your Data API subscription and token. "
-            f"Details: {format_api_error(expiry_response)}"
-        )
-        st.stop()
-
-    expiry_dates = expiry_response.get("data", [])
-
-except Exception as error:
-    st.error(
-        "Could not load expiry dates. "
-        "Check token, internet, and Data API subscription. "
-        f"Details: {error}"
-    )
-    st.stop()
-
-if not expiry_dates:
-    st.warning("No active expiry dates received.")
-    st.stop()
-
-selected_expiry = st.selectbox(
-    "Select Expiry",
-    expiry_dates,
-)
-
-if st.button(
-    "📊 Load Full Dashboard Analysis",
-    width="stretch",
-):
-    st.session_state.load_chain = True
-
-
-# =========================================================
-# MAIN ANALYSIS
-# =========================================================
-
-if st.session_state.load_chain:
-    try:
-        with st.spinner("Loading option chain and technical indicators..."):
-            chain_response = get_option_chain(
-                selected_index["security_id"],
-                selected_index["segment"],
-                selected_expiry,
-            )
-
-            candle_response_5m = get_intraday_candles(
-                selected_index["security_id"],
-                selected_index["segment"],
-                selected_index["instrument"],
-                "5",
-                CLIENT_ID,
-                ACCESS_TOKEN,
-            )
-
-            candle_response_15m = get_intraday_candles(
-                selected_index["security_id"],
-                selected_index["segment"],
-                selected_index["instrument"],
-                "15",
-                CLIENT_ID,
-                ACCESS_TOKEN,
-            )
-
-            candle_response_60m = get_intraday_candles(
-                selected_index["security_id"],
-                selected_index["segment"],
-                selected_index["instrument"],
-                "60",
-                CLIENT_ID,
-                ACCESS_TOKEN,
-            )
-
-        if chain_response.get("status") != "success":
-            st.error(
-                "Option-chain API returned an error. "
-                f"Details: {format_api_error(chain_response)}"
-            )
-            st.stop()
-
-        chain_data = chain_response.get("data", {})
-        spot_price = safe_float(chain_data.get("last_price"))
-        option_chain = chain_data.get("oc", {})
-
-        rows = []
-
-        for strike_text, option_data in option_chain.items():
-            strike = safe_float(strike_text)
-            ce = option_data.get("ce") or {}
-            pe = option_data.get("pe") or {}
-
-            ce_greeks = ce.get("greeks") or {}
-            pe_greeks = pe.get("greeks") or {}
-
-            ce_oi = safe_int(ce.get("oi"))
-            pe_oi = safe_int(pe.get("oi"))
-
-            ce_previous_oi = safe_int(ce.get("previous_oi"))
-            pe_previous_oi = safe_int(pe.get("previous_oi"))
-
-            rows.append(
-                {
-                    "CE OI": ce_oi,
-                    "CE Chg OI": ce_oi - ce_previous_oi,
-                    "CE Volume": safe_int(ce.get("volume")),
-                    "CE IV": safe_float(ce.get("implied_volatility")),
-                    "CE Delta": safe_float(ce_greeks.get("delta")),
-                    "CE Gamma": safe_float(ce_greeks.get("gamma")),
-                    "CE Theta": safe_float(ce_greeks.get("theta")),
-                    "CE Vega": safe_float(ce_greeks.get("vega")),
-                    "CE LTP": safe_float(ce.get("last_price")),
-                    "Strike": strike,
-                    "PE LTP": safe_float(pe.get("last_price")),
-                    "PE Delta": safe_float(pe_greeks.get("delta")),
-                    "PE Gamma": safe_float(pe_greeks.get("gamma")),
-                    "PE Theta": safe_float(pe_greeks.get("theta")),
-                    "PE Vega": safe_float(pe_greeks.get("vega")),
-                    "PE IV": safe_float(pe.get("implied_volatility")),
-                    "PE Volume": safe_int(pe.get("volume")),
-                    "PE Chg OI": pe_oi - pe_previous_oi,
-                    "PE OI": pe_oi,
-                }
-            )
-
-        dataframe = pd.DataFrame(rows)
-
-        if dataframe.empty:
-            st.warning("No option-chain data received.")
-            st.stop()
-
-        dataframe = dataframe.sort_values("Strike")
-        dataframe["ATM Distance"] = (
-            dataframe["Strike"] - spot_price
-        ).abs()
-
-        atm_index = dataframe["ATM Distance"].idxmin()
-        atm_row = dataframe.loc[atm_index]
-        atm_strike = safe_float(atm_row["Strike"])
-
-        atm_ce_change = safe_float(atm_row["CE Chg OI"])
-        atm_pe_change = safe_float(atm_row["PE Chg OI"])
-
-        # Intraday OI structure: resistance must be ABOVE ATM and support BELOW ATM.
-        # Use nearby strikes only, so far-away legacy OI does not create misleading levels.
-        strike_values = dataframe["Strike"].dropna().sort_values().unique()
-        strike_step = 50.0
-        if len(strike_values) >= 2:
-            differences = pd.Series(strike_values).diff().dropna()
-            positive_differences = differences[differences > 0]
-            if not positive_differences.empty:
-                strike_step = safe_float(positive_differences.median(), 50.0)
-
-        structure_window = max(strike_step * 12, 600.0)
-        nearby_structure = dataframe[
-            (dataframe["Strike"] >= atm_strike - structure_window)
-            & (dataframe["Strike"] <= atm_strike + structure_window)
-        ].copy()
-
-        resistance_candidates = nearby_structure[nearby_structure["Strike"] > atm_strike]
-        support_candidates = nearby_structure[nearby_structure["Strike"] < atm_strike]
-
-        if resistance_candidates.empty:
-            resistance_candidates = dataframe[dataframe["Strike"] > atm_strike]
-        if support_candidates.empty:
-            support_candidates = dataframe[dataframe["Strike"] < atm_strike]
-
-        resistance_ranked = resistance_candidates.nlargest(2, "CE OI")
-        support_ranked = support_candidates.nlargest(2, "PE OI")
-
-        resistance = (
-            safe_float(resistance_ranked.iloc[0]["Strike"])
-            if not resistance_ranked.empty
-            else atm_strike
-        )
-        resistance_2 = (
-            safe_float(resistance_ranked.iloc[1]["Strike"])
-            if len(resistance_ranked) > 1
-            else 0.0
-        )
-        support = (
-            safe_float(support_ranked.iloc[0]["Strike"])
-            if not support_ranked.empty
-            else atm_strike
-        )
-        support_2 = (
-            safe_float(support_ranked.iloc[1]["Strike"])
-            if len(support_ranked) > 1
-            else 0.0
+            "This is an indicative decision-support plan, not a guaranteed call. "
+            "Do not enter without checking bid–ask spread, liquidity and candle confirmation."
         )
 
-        nearest_base = dataframe.nsmallest(21, "ATM Distance")
-        important_rows = dataframe[
-            dataframe["Strike"].apply(
-                lambda value: any(
-                    math.isclose(safe_float(value), level, rel_tol=0, abs_tol=0.001)
-                    for level in [atm_strike, resistance, resistance_2, support, support_2]
-                )
-            )
-        ]
-        nearest_rows = (
-            pd.concat([nearest_base, important_rows], ignore_index=True)
-            .drop_duplicates(subset=["Strike"])
-            .sort_values("Strike")
-            .drop(columns=["ATM Distance"])
-        )
-
-        total_ce_oi = dataframe["CE OI"].sum()
-        total_pe_oi = dataframe["PE OI"].sum()
-        total_ce_change = dataframe["CE Chg OI"].sum()
-        total_pe_change = dataframe["PE Chg OI"].sum()
-
-        pcr = total_pe_oi / total_ce_oi if total_ce_oi else 0
-
-        max_pain = calculate_max_pain(dataframe)
-
-        candles_5m = enrich_candles(
-            candles_to_dataframe(candle_response_5m)
-        )
-
-        candles_15m = enrich_candles(
-            candles_to_dataframe(candle_response_15m)
-        )
-
-        candles_60m = enrich_candles(
-            candles_to_dataframe(candle_response_60m)
-        )
-
-        candles = candles_5m
-        previous_day_pivots = calculate_previous_day_pivots(candles_5m)
-
-        latest_rsi = 50.0
-        latest_vwap = 0.0
-        latest_atr = 0.0
-        trend_direction = 0
-        latest_supertrend = 0.0
-
-        if not candles.empty:
-            latest = candles.iloc[-1]
-            latest_rsi = safe_float(latest["RSI"], 50.0)
-            latest_vwap = safe_float(latest["VWAP"])
-            latest_atr = safe_float(latest["ATR"])
-            trend_direction = safe_int(latest["TrendDirection"])
-            latest_supertrend = safe_float(latest["Supertrend"], 0.0)
-
-            if not latest_supertrend and latest_atr:
-                latest_close = safe_float(latest["Close"], spot_price)
-
-                if trend_direction == 1:
-                    latest_supertrend = latest_close - 3 * latest_atr
-                elif trend_direction == -1:
-                    latest_supertrend = latest_close + 3 * latest_atr
-
-        snapshot_5m = timeframe_snapshot(candles_5m)
-        snapshot_15m = timeframe_snapshot(candles_15m)
-        snapshot_60m = timeframe_snapshot(candles_60m)
-        mtf_result = mtf_confirmation(snapshot_5m, snapshot_15m)
-
-        (
-            mtf_agreement,
-            mtf_direction_5m,
-            mtf_direction_15m,
-        ) = calculate_mtf_agreement(
-            snapshot_5m,
-            snapshot_15m,
-        )
-
-        order_blocks = detect_order_blocks(candles)
-        fair_value_gaps = detect_fair_value_gaps(candles)
-        buy_liquidity, sell_liquidity = detect_liquidity_levels(candles)
-        institutional_activity, volume_ratio = detect_institutional_activity(
-            candles
-        )
-        smc_market_bias, smc_strength, smc_reasons = smc_bias(
-            spot_price,
-            order_blocks,
-            fair_value_gaps,
-            buy_liquidity,
-            sell_liquidity,
-        )
-
-        (
-            oi_summary,
-            oi_bias,
-            oi_notes,
-        ) = analyse_oi_build_up(
-            total_ce_change,
-            total_pe_change,
-            atm_ce_change,
-            atm_pe_change,
-        )
-
-        (
-            recommendation,
-            sentiment,
-            signal_class,
-            quality_score,
-            reasons,
-            bullish_points,
-            bearish_points,
-        ) = build_signal_and_score(
-            pcr,
-            total_ce_change,
-            total_pe_change,
-            atm_ce_change,
-            atm_pe_change,
-            spot_price,
-            support,
-            resistance,
-            max_pain,
-            latest_rsi,
-            latest_vwap,
-            trend_direction,
-        )
-
-        (
-            recommendation,
-            quality_score,
-            mtf_filter_notes,
-        ) = refine_recommendation_with_mtf(
-            recommendation,
-            quality_score,
-            mtf_result,
-            snapshot_5m,
-            snapshot_15m,
-        )
-
-        if recommendation == "BUY CE BIAS":
-            sentiment = "Bullish"
-            signal_class = "signal-bullish"
-        elif recommendation == "BUY PE BIAS":
-            sentiment = "Bearish"
-            signal_class = "signal-bearish"
+with chart_tab:
+    if df5.empty and df15.empty:
+        st.info("Turn on live data or press Refresh Live Data after validating Dhan credentials.")
+    else:
+        if not df5.empty:
+            st.plotly_chart(chart_figure(df5.tail(120), f"{selected_market} — 5-Minute Entry Chart"), use_container_width=True)
         else:
-            sentiment = "Sideways"
-            signal_class = "signal-neutral"
+            st.warning(f"5-minute chart unavailable: {result5.message}")
 
-        reasons.extend(mtf_filter_notes)
-
-        ai_confidence = calculate_ai_confidence(
-            quality_score,
-            mtf_agreement,
-            mtf_direction_5m,
-            mtf_direction_15m,
-            mtf_result["Points"],
-        )
-
-        final_ai_recommendation = final_mtf_recommendation(
-            recommendation,
-            mtf_direction_5m,
-            mtf_direction_15m,
-            mtf_agreement,
-            ai_confidence,
-        )
-
-        professional_grade = build_three_timeframe_grade(
-            snapshot_5m,
-            snapshot_15m,
-            snapshot_60m,
-            mtf_agreement,
-            ai_confidence,
-        )
-
-        directional_plan = directional_bias_plan(
-            snapshot_5m,
-            snapshot_15m,
-            snapshot_60m,
-            spot_price,
-            support,
-            resistance,
-            atm_strike,
-        )
-
-        final_ai_recommendation = professional_grade["Grade"]
-        ai_confidence = professional_grade["Score"]
-
-        if final_ai_recommendation == "BUY CE":
-            recommendation = "BUY CE BIAS"
-            sentiment = "Bullish"
-            signal_class = "signal-bullish"
-            quality_score = ai_confidence
-        elif final_ai_recommendation == "BUY PE":
-            recommendation = "BUY PE BIAS"
-            sentiment = "Bearish"
-            signal_class = "signal-bearish"
-            quality_score = ai_confidence
+        if not df15.empty:
+            st.plotly_chart(chart_figure(df15.tail(120), f"{selected_market} — 15-Minute Confirmation Chart"), use_container_width=True)
         else:
-            recommendation = "WAIT / NO TRADE"
-            sentiment = "Sideways"
-            signal_class = "signal-neutral"
-            quality_score = ai_confidence
+            st.warning(f"15-minute chart unavailable: {result15.message}")
 
-        if professional_grade["Direction"] == "BUY CE":
-            recommendation = "BUY CE BIAS"
-            sentiment = "Bullish"
-            signal_class = "signal-bullish"
-        elif professional_grade["Direction"] == "BUY PE":
-            recommendation = "BUY PE BIAS"
-            sentiment = "Bearish"
-            signal_class = "signal-bearish"
+with chain_tab:
+    st.markdown(f'<div class="option-title"><b>OPTION CHAIN — {selected_market}</b><span>🟢 Support • 🔴 Resistance • 🟡 ATM • 5m execution / 15m trend</span></div>', unsafe_allow_html=True)
+    mobile_compact = st.toggle("📱 Compact mobile option chain", value=False)
+    strike_count = 7 if mobile_compact else 21
+    if df_chain.empty:
+        st.info("No live option-chain data loaded. Validate Dhan, load expiries, then refresh.")
+        if chain_result.message not in ("Not loaded", ""):
+            st.caption(chain_result.message)
+    else:
+        display = df_chain.copy()
+
+        # Show strikes nearest spot first while keeping a clean CE | Strike | PE layout.
+        if spot is not None:
+            display["_distance"] = (display["Strike"] - spot).abs()
+            display = display.nsmallest(strike_count, "_distance").sort_values("Strike").drop(columns="_distance")
         else:
-            recommendation = "WAIT / NO TRADE"
-            sentiment = "Sideways"
-            signal_class = "signal-neutral"
+            display = display.head(strike_count)
 
-        quality_score = ai_confidence
-
-        (
-            alert_title,
-            alert_class,
-            alert_note,
-            breakout_level,
-            breakdown_level,
-        ) = breakout_breakdown_status(
-            spot_price,
-            support,
-            resistance,
-            selected_index["alert_buffer"],
-        )
-
-        # =====================================================
-        # V22 UNIFIED FINAL DECISION ENGINE
-        # One actionable output only: BUY CE / BUY PE / WAIT.
-        # Trend bias may remain visible, but it cannot become an entry
-        # until price-action trigger and non-opposing SMC agree.
-        # =====================================================
-        mtf_direction = professional_grade.get("Direction", "WAIT")
-        smc_bullish = "Bullish" in smc_market_bias
-        smc_bearish = "Bearish" in smc_market_bias
-        ce_trigger_confirmed = alert_title == "BREAKOUT CONFIRMED"
-        pe_trigger_confirmed = alert_title == "BREAKDOWN CONFIRMED"
-        vix_risk_high = vix_value >= 22 if vix_value > 0 else False
-
-        # V31 confidence policy (single source of truth):
-        # 80-100 = BUY CE / BUY PE, 70-79 = WAIT FOR CONFIRMATION,
-        # 0-69 = NO TRADE. Every lower panel must follow this result.
-        if ai_confidence >= 80 and mtf_direction == "BUY CE":
-            unified_action = "BUY CE"
-            unified_grade = "BUY CE — HIGH CONFIDENCE"
-            unified_reason = (
-                "Confidence is 80% or above and the multi-timeframe direction is bullish. "
-                f"Use ₹{breakout_level:,.0f} as the entry trigger and avoid chasing before confirmation."
-            )
-            unified_class = "grade-strong-buy"
-            unified_banner_class = "final-one-buy-ce"
-        elif ai_confidence >= 80 and mtf_direction == "BUY PE":
-            unified_action = "BUY PE"
-            unified_grade = "BUY PE — HIGH CONFIDENCE"
-            unified_reason = (
-                "Confidence is 80% or above and the multi-timeframe direction is bearish. "
-                f"Use ₹{breakdown_level:,.0f} as the entry trigger and avoid chasing before confirmation."
-            )
-            unified_class = "grade-avoid"
-            unified_banner_class = "final-one-buy-pe"
-        elif 70 <= ai_confidence <= 79:
-            unified_action = "WAIT"
-            unified_grade = "WAIT FOR CONFIRMATION"
-            if mtf_direction == "BUY CE":
-                unified_reason = f"Bullish bias is present, but confidence is below 80%. Watch breakout above ₹{breakout_level:,.0f}."
-            elif mtf_direction == "BUY PE":
-                unified_reason = f"Bearish bias is present, but confidence is below 80%. Watch breakdown below ₹{breakdown_level:,.0f}."
-            else:
-                unified_reason = "Confidence is 70–79%, but the 5m, 15m and 60m directions are not aligned."
-            unified_class = "grade-wait"
-            unified_banner_class = "final-one-wait"
-        else:
-            unified_action = "NO TRADE"
-            unified_grade = "NO TRADE — CAPITAL PROTECTION"
-            unified_reason = "Confidence is 69% or below. No CE or PE trade is allowed."
-            unified_class = "grade-avoid"
-            unified_banner_class = "final-one-buy-pe"
-
-        professional_grade = {
-            **professional_grade,
-            "Grade": unified_grade,
-            "Class": unified_class,
-            "Direction": unified_action if unified_action in {"BUY CE", "BUY PE"} else "WAIT",
-            "Reason": unified_reason,
-        }
-        final_ai_recommendation = unified_action
-        recommendation = (
-            "BUY CE BIAS" if unified_action == "BUY CE"
-            else "BUY PE BIAS" if unified_action == "BUY PE"
-            else "WAIT / NO TRADE"
-        )
-        sentiment = "Bullish" if unified_action == "BUY CE" else "Bearish" if unified_action == "BUY PE" else "Sideways"
-        signal_class = "signal-bullish" if unified_action == "BUY CE" else "signal-bearish" if unified_action == "BUY PE" else "signal-neutral"
-
-        # Force every downstream panel to use the same final decision.
-        if unified_action == "BUY CE":
-            directional_plan = {
-                **directional_plan,
-                "Bias": "BULLISH",
-                "OptionSide": "CE",
-                "RecommendedStrike": float(atm_strike),
-                "Trigger": float(breakout_level),
-                "Invalidation": float(support),
-            }
-        elif unified_action == "BUY PE":
-            directional_plan = {
-                **directional_plan,
-                "Bias": "BEARISH",
-                "OptionSide": "PE",
-                "RecommendedStrike": float(atm_strike),
-                "Trigger": float(breakdown_level),
-                "Invalidation": float(resistance),
-            }
-        else:
-            directional_plan = {
-                **directional_plan,
-                "Bias": unified_grade,
-                "OptionSide": unified_action,
-                "RecommendedStrike": 0.0,
-                "Trigger": 0.0,
-                "Invalidation": 0.0,
-            }
-
-        if unified_action in {"BUY CE", "BUY PE"}:
-            option_type, option_strike, option_premium = select_option_contract(
-                dataframe,
-                recommendation,
-                atm_strike,
-            )
-            (
-                premium_entry,
-                premium_stop,
-                premium_target1,
-                premium_target2,
-                premium_target3,
-            ) = calculate_option_premium_levels(
-                option_premium,
-                recommendation,
-                latest_atr,
-            )
-            pro_option_plan = refined_option_plan(
-                professional_grade["Direction"],
-                option_type,
-                premium_entry,
-                premium_stop,
-                premium_target1,
-                premium_target2,
-                premium_target3,
-            )
-        else:
-            option_type = ""
-            option_strike = 0.0
-            option_premium = 0.0
-            premium_entry = premium_stop = 0.0
-            premium_target1 = premium_target2 = premium_target3 = 0.0
-            pro_option_plan = {
-                "Action": unified_action,
-                "RiskReward": "N/A",
-            }
-
-        add_signal_to_log(
-            index_choice,
-            selected_expiry,
-            recommendation,
-            option_strike,
-            option_type,
-            premium_entry,
-            premium_stop,
-            premium_target1,
-            quality_score,
-        )
-
-        st.success(f"✅ {index_choice} full analysis loaded")
-
-        # ---------------- SUMMARY METRICS ----------------
-
-        summary1 = st.columns(6)
-
-        summary1[0].metric("Spot", f"₹ {spot_price:,.2f}")
-        summary1[1].metric("ATM", f"₹ {atm_strike:,.0f}")
-        summary1[2].metric("PCR", f"{pcr:.2f}")
-        summary1[3].metric("Max Pain", f"₹ {max_pain:,.0f}")
-        summary1[4].metric("Support S1", f"₹ {support:,.0f}")
-        summary1[5].metric("Resistance R1", f"₹ {resistance:,.0f}")
-
-        structure_cols = st.columns(4)
-        structure_cols[0].metric("Support S1", f"₹ {support:,.0f}")
-        structure_cols[1].metric("Support S2", f"₹ {support_2:,.0f}" if support_2 else "N/A")
-        structure_cols[2].metric("Resistance R1", f"₹ {resistance:,.0f}")
-        structure_cols[3].metric("Resistance R2", f"₹ {resistance_2:,.0f}" if resistance_2 else "N/A")
-
-        summary2 = st.columns(6)
-
-        summary2[0].metric("RSI", f"{latest_rsi:.1f}")
-        summary2[1].metric("VWAP", f"₹ {latest_vwap:,.2f}")
-        summary2[2].metric(
-            "Supertrend",
-            "Bullish" if trend_direction == 1 else (
-                "Bearish" if trend_direction == -1 else "Unavailable"
-            ),
-        )
-        summary2[3].metric(
-            "Supertrend Level",
-            f"₹ {latest_supertrend:,.2f}" if latest_supertrend else "N/A",
-        )
-        summary2[4].metric("ATR", f"{latest_atr:.2f}")
-        summary2[5].metric("Trade Quality", f"{quality_score}/100")
-
-        freshness_columns = st.columns(3)
-
-        freshness_columns[0].metric(
-            "Data Time",
-            (
-                candles["Datetime"].iloc[-1].strftime("%I:%M:%S %p")
-                if not candles.empty
-                else "Unavailable"
-            ),
-        )
-        freshness_columns[1].metric(
-            "Selected Interval",
-            f"{chart_interval} minute",
-        )
-        freshness_columns[2].metric(
-            "API Status",
-            "Connected",
-        )
-
-        render_pivot_dashboard(previous_day_pivots)
-
-        # ---------------- PROFESSIONAL AI CONFIRMATION ----------------
-
-        st.subheader("🎯 Final Options Decision")
-
-        final_decision_columns = st.columns(6)
-
-        final_decision_columns[0].metric(
-            "Decision",
-            professional_grade["Grade"],
-        )
-        final_decision_columns[1].metric(
-            "Confidence",
-            f"{ai_confidence}%",
-        )
-        final_decision_columns[2].metric(
-            "Preferred Option",
-            directional_plan["OptionSide"],
-        )
-        final_decision_columns[3].metric(
+        wanted = [
+            "CE_OI", "CE_OI_CHANGE", "CE_VOLUME", "CE_IV", "CE_DELTA",
+            "CE_THETA", "CE_LTP", "CE_BID", "CE_ASK",
             "Strike",
-            (
-                f"{directional_plan['RecommendedStrike']:.0f} "
-                f"{directional_plan['OptionSide']}"
-                if directional_plan["OptionSide"] in {"CE", "PE"}
-                else "No Trade"
-            ),
-        )
-        final_decision_columns[4].metric(
-            "Entry Trigger",
-            (
-                f"₹ {directional_plan['Trigger']:,.2f}"
-                if directional_plan["Trigger"]
-                else "Wait"
-            ),
-        )
-        final_decision_columns[5].metric(
-            "Invalidation",
-            (
-                f"₹ {directional_plan['Invalidation']:,.2f}"
-                if directional_plan["Invalidation"]
-                else "N/A"
-            ),
-        )
-
-        st.markdown(
-            f'<div class="final-one-banner {unified_banner_class}">'
-            f'{unified_action} — {professional_grade["Grade"]} — {ai_confidence}/100'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            f'<div class="professional-note">'
-            f'{professional_grade["Reason"]}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.subheader("📊 Professional Multi-Timeframe Confirmation")
-
-        def render_full_mtf_panel(tf_label, snapshot, css_class):
-            direction = mtf_trade_direction(snapshot)
-            supertrend_text = (
-                "Bullish" if snapshot["Trend"] == 1
-                else "Bearish" if snapshot["Trend"] == -1
-                else "N/A"
-            )
-            vwap_text = f'₹ {snapshot["VWAP"]:,.2f}' if snapshot["VWAP"] else "N/A"
-            html = (
-                f'<div class="mtf-full-panel {css_class}">'
-                f'<div class="mtf-full-title">📊 {tf_label} ANALYSIS</div>'
-                '<div class="mtf-full-grid">'
-                f'<div class="mtf-full-item"><div class="mtf-full-label">Trend</div><div class="mtf-full-value">{direction}</div></div>'
-                f'<div class="mtf-full-item"><div class="mtf-full-label">RSI</div><div class="mtf-full-value">{snapshot["RSI"]:.1f}</div></div>'
-                f'<div class="mtf-full-item"><div class="mtf-full-label">VWAP</div><div class="mtf-full-value">{vwap_text}</div></div>'
-                f'<div class="mtf-full-item"><div class="mtf-full-label">Supertrend</div><div class="mtf-full-value">{supertrend_text}</div></div>'
-                '</div></div>'
-            )
-            render_html(html)
-
-        render_full_mtf_panel("5 MINUTE", snapshot_5m, "mtf-5m")
-        render_full_mtf_panel("15 MINUTE", snapshot_15m, "mtf-15m")
-        render_full_mtf_panel("60 MINUTE", snapshot_60m, "mtf-60m")
-
-        mtf_summary = st.columns(4)
-        mtf_summary[0].metric("5m vs 15m Agreement", f"{mtf_agreement}%")
-        mtf_summary[1].metric("AI Confidence", f"{ai_confidence}%")
-        mtf_summary[2].metric("MTF Score", f"{mtf_result['Points']}")
-        mtf_summary[3].metric("Final Grade", professional_grade["Grade"])
-
-        # ---------------- FINAL SIGNAL ----------------
-
-
-        st.write("**Signal reasons:** " + " | ".join(reasons))
-
-
-        st.subheader("🧠 AI-Style SMC Decision Panel")
-
-        ai_columns = st.columns(5)
-
-        ai_columns[0].metric("Final Recommendation", unified_action)
-        ai_columns[1].metric("SMC Bias", smc_market_bias)
-        ai_columns[2].metric(
-            "Institutional Activity",
-            institutional_activity,
-        )
-        ai_columns[3].metric(
-            "Volume Ratio",
-            f"{volume_ratio:.2f}x",
-        )
-        ai_columns[4].metric(
-            "SMC Strength",
-            f"{smc_strength}/5",
-        )
-
-        st.caption(
-            "AI-style means a multi-factor rule engine; it is not a trained "
-            "machine-learning model. SMC detections are heuristic."
-        )
-        st.write("**SMC reasons:** " + " | ".join(smc_reasons))
-
-        status_css = (
-            "alert-breakout" if unified_action == "BUY CE"
-            else "alert-breakdown" if unified_action == "BUY PE"
-            else "alert-range"
-        )
-        st.markdown(
-            f'<div class="{status_css}"><strong>{unified_grade}</strong>: {unified_reason}</div>',
-            unsafe_allow_html=True,
-        )
-
-        if (
-            sound_alert
-            and unified_action in {"BUY CE", "BUY PE"}
-            and recommendation != st.session_state.last_signal
-        ):
-            play_signal_sound()
-
-        st.session_state.last_signal = recommendation
-
-        # ---------------- EXACT OPTION PLAN ----------------
-
-        st.subheader("🧭 Options Direction & Entry Trigger")
-
-        bias_columns = st.columns(6)
-
-        bias_columns[0].metric(
-            "Market Bias",
-            directional_plan["Bias"],
-        )
-        bias_columns[1].metric(
-            "Preferred Option",
-            directional_plan["OptionSide"],
-        )
-        bias_columns[2].metric(
-            "Recommended Strike",
-            (
-                f"{directional_plan['RecommendedStrike']:.0f} "
-                f"{directional_plan['OptionSide']}"
-                if directional_plan["OptionSide"] in {"CE", "PE"}
-                else "No Trade"
-            ),
-        )
-        bias_columns[3].metric(
-            "Entry Trigger",
-            (
-                f"₹ {directional_plan['Trigger']:,.2f}"
-                if directional_plan["Trigger"]
-                else "Wait"
-            ),
-        )
-        bias_columns[4].metric(
-            "Invalidation",
-            (
-                f"₹ {directional_plan['Invalidation']:,.2f}"
-                if directional_plan["Invalidation"]
-                else "N/A"
-            ),
-        )
-        bias_columns[5].metric(
-            "Bias Weight",
-            (
-                f"Bull {directional_plan['BullishWeight']} / "
-                f"Bear {directional_plan['BearishWeight']}"
-            ),
-        )
-
-        st.caption(
-            "V31 policy: 80–100% = BUY, 70–79% = WAIT FOR CONFIRMATION, "
-            "0–69% = NO TRADE. All panels use this same final decision."
-        )
-
-        st.subheader("🎯 Exact Option Trade Reference")
-
-        plan = st.columns(6)
-
-        plan[0].metric(
-            "Action",
-            pro_option_plan["Action"],
-        )
-        plan[1].metric(
-            "Option",
-            (
-                f"{option_strike:.0f} {option_type}"
-                if unified_action in {"BUY CE", "BUY PE"}
-                else "No Trade"
-            ),
-        )
-        plan[2].metric(
-            "Premium Entry",
-            f"₹ {premium_entry:,.2f}" if premium_entry else "Wait",
-        )
-        plan[3].metric(
-            "Premium Stop",
-            f"₹ {premium_stop:,.2f}" if premium_stop else "Wait",
-        )
-        plan[4].metric(
-            "Target 1",
-            f"₹ {premium_target1:,.2f}" if premium_target1 else "Wait",
-        )
-        plan[5].metric(
-            "Target 2 / 3",
-            (
-                f"₹ {premium_target2:,.2f} / ₹ {premium_target3:,.2f}"
-                if premium_target2
-                else "Wait"
-            ),
-        )
-
-        st.caption(
-            "Premium levels are references derived from current premium and "
-            "ATR context. Verify liquidity and price action before trading."
-        )
-
-        rr_columns = st.columns(3)
-
-        rr_columns[0].metric(
-            "Risk:Reward",
-            pro_option_plan["RiskReward"],
-        )
-        rr_columns[1].metric(
-            "Setup Quality",
-            professional_grade["Grade"],
-        )
-        rr_columns[2].metric(
-            "Higher-Timeframe Filter",
-            mtf_trade_direction(snapshot_60m),
-        )
-
-        # ---------------- RISK CALCULATOR ----------------
-
-        st.subheader("🛡️ Position Size & Risk")
-
-        maximum_risk = trading_capital * risk_percent / 100
-        premium_risk_per_unit = max(
-            premium_entry - premium_stop,
-            0,
-        )
-
-        risk_per_lot = premium_risk_per_unit * lot_size
-
-        allowed_lots = (
-            math.floor(maximum_risk / risk_per_lot)
-            if risk_per_lot > 0
-            else 0
-        )
-
-        required_capital_one_lot = premium_entry * lot_size
-
-        risk_columns = st.columns(6)
-
-        risk_columns[0].metric(
-            "Max Risk",
-            f"₹ {maximum_risk:,.2f}",
-        )
-        risk_columns[1].metric(
-            "Risk / Unit",
-            f"₹ {premium_risk_per_unit:,.2f}",
-        )
-        risk_columns[2].metric(
-            "Risk / Lot",
-            f"₹ {risk_per_lot:,.2f}",
-        )
-        risk_columns[3].metric(
-            "Allowed Lots",
-            str(allowed_lots),
-        )
-        risk_columns[4].metric(
-            "Quantity",
-            str(allowed_lots * lot_size),
-        )
-        risk_columns[5].metric(
-            "Approx. Premium Capital / Lot",
-            f"₹ {required_capital_one_lot:,.2f}",
-        )
-
-        if option_type != "WAIT" and allowed_lots == 0:
-            st.warning(
-                "Your selected risk limit does not allow even one full lot "
-                "at the displayed stop-loss distance."
-            )
-
-        # ---------------- PAPER TRADING ----------------
-
-        st.subheader("🧪 One-Click Paper Trading")
-
-        for auto_message in auto_manage_paper_positions(dataframe):
-            st.info(auto_message)
-
-        paper_columns = st.columns(4)
-
-        paper_quantity = paper_columns[0].number_input(
-            "Paper Quantity",
-            min_value=1,
-            value=max(int(lot_size), 1),
-            step=max(int(lot_size), 1),
-            key="paper_quantity",
-        )
-
-        paper_columns[1].metric(
-            "Paper Balance",
-            f"₹ {st.session_state.paper_balance:,.2f}",
-        )
-
-        paper_columns[2].metric(
-            "Open Positions",
-            str(len(st.session_state.paper_positions)),
-        )
-
-        paper_columns[3].metric(
-            "Closed Trades",
-            str(len(st.session_state.paper_trades)),
-        )
-
-        open_disabled = (
-            option_type == "WAIT"
-            or premium_entry <= 0
-        )
-
-        if st.button(
-            "▶️ One-Click Paper Trade",
-            disabled=open_disabled,
-            width="stretch",
-        ):
-            success, message = open_paper_position(
-                index_choice,
-                selected_expiry,
-                option_type,
-                option_strike,
-                premium_entry,
-                int(paper_quantity),
-                premium_stop,
-                premium_target1,
-            )
-
-            if success:
-                st.success(message)
-            else:
-                st.error(message)
-
-        open_positions_frame = paper_positions_dataframe(dataframe)
-
-        if not open_positions_frame.empty:
-            st.write("**Open Paper Positions**")
-
-            st.dataframe(
-                open_positions_frame,
-                width="stretch",
-                hide_index=True,
-            )
-
-            position_ids = open_positions_frame["ID"].tolist()
-
-            selected_position_id = st.selectbox(
-                "Select position to close",
-                position_ids,
-            )
-
-            if st.button("⏹️ Close Selected Paper Position"):
-                success, message = close_paper_position(
-                    int(selected_position_id),
-                    dataframe,
-                    "Manual Exit",
-                )
-
-                if success:
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
-
-        paper_stats = calculate_paper_statistics()
-
-        paper_stats_columns = st.columns(6)
-
-        paper_stats_columns[0].metric(
-            "Paper Total Trades",
-            str(paper_stats["Total Trades"]),
-        )
-        paper_stats_columns[1].metric(
-            "Paper Wins",
-            str(paper_stats["Winning Trades"]),
-        )
-        paper_stats_columns[2].metric(
-            "Paper Losses",
-            str(paper_stats["Losing Trades"]),
-        )
-        paper_stats_columns[3].metric(
-            "Paper Win Rate",
-            f"{paper_stats['Win Rate']:.1f}%",
-        )
-        paper_stats_columns[4].metric(
-            "Paper Net P&L",
-            f"₹ {paper_stats['Net PnL']:,.2f}",
-        )
-        paper_stats_columns[5].metric(
-            "Average P&L",
-            f"₹ {paper_stats['Average PnL']:,.2f}",
-        )
-
-        closed_paper_frame = pd.DataFrame(
-            st.session_state.paper_trades
-        )
-
-        if not closed_paper_frame.empty:
-            with st.expander("View Paper Trade Journal"):
-                st.dataframe(
-                    closed_paper_frame,
-                    width="stretch",
-                    hide_index=True,
-                )
-
-                st.download_button(
-                    "⬇️ Download Paper Journal CSV",
-                    data=closed_paper_frame.to_csv(
-                        index=False
-                    ).encode("utf-8"),
-                    file_name="shankar_paper_trade_journal.csv",
-                    mime="text/csv",
-                )
-
-        # ---------------- BACKTESTING ----------------
-
-        st.subheader("🧮 Historical 5-Minute Entry Strategy Backtest")
-
-        backtest_columns = st.columns(2)
-
-        backtest_capital = backtest_columns[0].number_input(
-            "Backtest starting capital (₹)",
-            min_value=10000.0,
-            value=100000.0,
-            step=10000.0,
-        )
-
-        backtest_risk = backtest_columns[1].number_input(
-            "Backtest risk per trade (%)",
-            min_value=0.25,
-            max_value=5.0,
-            value=1.0,
-            step=0.25,
-        )
-
-        if st.button("Run Backtest", width="stretch"):
-            backtest_trades, backtest_summary = backtest_strategy(
-                candles,
-                initial_capital=backtest_capital,
-                risk_percent=backtest_risk,
-            )
-
-            result_columns = st.columns(6)
-
-            result_columns[0].metric(
-                "Initial Capital",
-                f"₹ {backtest_summary['Initial Capital']:,.2f}",
-            )
-            result_columns[1].metric(
-                "Final Capital",
-                f"₹ {backtest_summary['Final Capital']:,.2f}",
-            )
-            result_columns[2].metric(
-                "Net P&L",
-                f"₹ {backtest_summary['Net PnL']:,.2f}",
-            )
-            result_columns[3].metric(
-                "Total Trades",
-                str(backtest_summary["Total Trades"]),
-            )
-            result_columns[4].metric(
-                "Win Rate",
-                f"{backtest_summary['Win Rate']:.1f}%",
-            )
-            result_columns[5].metric(
-                "Max Drawdown",
-                f"{backtest_summary['Max Drawdown']:.2f}%",
-            )
-
-            if not backtest_trades.empty:
-                st.dataframe(
-                    backtest_trades,
-                    width="stretch",
-                    hide_index=True,
-                )
-
-                st.download_button(
-                    "⬇️ Download Backtest Results CSV",
-                    data=backtest_trades.to_csv(
-                        index=False
-                    ).encode("utf-8"),
-                    file_name="shankar_backtest_results.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info(
-                    "No backtest trades were generated for the available "
-                    "historical candles and selected rules."
-                )
-
-        # ---------------- OI ANALYSIS ----------------
-
-        st.subheader("📊 OI Build-Up Analysis")
-
-        oi_columns = st.columns(6)
-
-        oi_columns[0].metric("OI Build-Up", oi_summary)
-        oi_columns[1].metric("OI Bias", oi_bias)
-        oi_columns[2].metric(
-            "Total CE Chg OI",
-            f"{total_ce_change:,.0f}",
-        )
-        oi_columns[3].metric(
-            "Total PE Chg OI",
-            f"{total_pe_change:,.0f}",
-        )
-        oi_columns[4].metric(
-            "ATM CE Chg OI",
-            f"{atm_ce_change:,.0f}",
-        )
-        oi_columns[5].metric(
-            "ATM PE Chg OI",
-            f"{atm_pe_change:,.0f}",
-        )
-
-        st.caption(" | ".join(oi_notes))
-
-        # ---------------- SMC / LIQUIDITY ----------------
-
-        st.subheader("🏦 Smart Money Concepts")
-
-        smc_columns = st.columns(6)
-
-        latest_bullish_ob = next(
-            (
-                item for item in reversed(order_blocks)
-                if item["Type"] == "Bullish Order Block"
-            ),
-            None,
-        )
-        latest_bearish_ob = next(
-            (
-                item for item in reversed(order_blocks)
-                if item["Type"] == "Bearish Order Block"
-            ),
-            None,
-        )
-        latest_bullish_fvg = next(
-            (
-                item for item in reversed(fair_value_gaps)
-                if item["Type"] == "Bullish FVG"
-            ),
-            None,
-        )
-        latest_bearish_fvg = next(
-            (
-                item for item in reversed(fair_value_gaps)
-                if item["Type"] == "Bearish FVG"
-            ),
-            None,
-        )
-
-        smc_columns[0].metric(
-            "Bullish Order Block",
-            (
-                f"₹ {latest_bullish_ob['Low']:,.0f}–"
-                f"{latest_bullish_ob['High']:,.0f}"
-                if latest_bullish_ob
-                else "N/A"
-            ),
-        )
-        smc_columns[1].metric(
-            "Bearish Order Block",
-            (
-                f"₹ {latest_bearish_ob['Low']:,.0f}–"
-                f"{latest_bearish_ob['High']:,.0f}"
-                if latest_bearish_ob
-                else "N/A"
-            ),
-        )
-        smc_columns[2].metric(
-            "Bullish FVG",
-            (
-                f"₹ {latest_bullish_fvg['Low']:,.0f}–"
-                f"{latest_bullish_fvg['High']:,.0f}"
-                if latest_bullish_fvg
-                else "N/A"
-            ),
-        )
-        smc_columns[3].metric(
-            "Bearish FVG",
-            (
-                f"₹ {latest_bearish_fvg['Low']:,.0f}–"
-                f"{latest_bearish_fvg['High']:,.0f}"
-                if latest_bearish_fvg
-                else "N/A"
-            ),
-        )
-        smc_columns[4].metric(
-            "Buy-side Liquidity",
-            f"₹ {buy_liquidity:,.2f}" if buy_liquidity else "N/A",
-        )
-        smc_columns[5].metric(
-            "Sell-side Liquidity",
-            f"₹ {sell_liquidity:,.2f}" if sell_liquidity else "N/A",
-        )
-
-        # ---------------- CHARTS ----------------
-
-        st.subheader("📉 Professional Multi-Timeframe Chart")
-
-        if not candles.empty:
-            professional_chart = build_professional_candlestick(
-                candles,
-                support,
-                resistance,
-                max_pain,
-                order_blocks,
-                fair_value_gaps,
-                buy_liquidity,
-                sell_liquidity,
-            )
-
-            if not candles_15m.empty:
-                recent_15m = candles_15m.tail(100)
-
-                professional_chart.add_trace(
-                    go.Scatter(
-                        x=recent_15m["Datetime"],
-                        y=recent_15m["Close"],
-                        mode="lines",
-                        name="15m Close",
-                        line={"width": 2, "dash": "dot"},
-                    )
-                )
-
-                professional_chart.add_trace(
-                    go.Scatter(
-                        x=recent_15m["Datetime"],
-                        y=recent_15m["VWAP"],
-                        mode="lines",
-                        name="15m VWAP",
-                        line={"width": 1.8, "dash": "dash"},
-                    )
-                )
-
-            if not candles_60m.empty:
-                recent_60m = candles_60m.tail(80)
-
-                professional_chart.add_trace(
-                    go.Scatter(
-                        x=recent_60m["Datetime"],
-                        y=recent_60m["Close"],
-                        mode="lines",
-                        name="60m Close",
-                        line={"width": 2.2, "dash": "longdash"},
-                    )
-                )
-
-                professional_chart.add_trace(
-                    go.Scatter(
-                        x=recent_60m["Datetime"],
-                        y=recent_60m["VWAP"],
-                        mode="lines",
-                        name="60m VWAP",
-                        line={"width": 1.6, "dash": "dot"},
-                    )
-                )
-
-            st.plotly_chart(
-                professional_chart,
-                width="stretch",
-                config={
-                    "displaylogo": False,
-                    "scrollZoom": True,
-                    "responsive": True,
-                },
-            )
-        else:
-            st.warning(
-                "Historical candles were unavailable, so the professional "
-                "chart and SMC analysis could not be calculated."
-            )
-
-        st.subheader("📊 OI Profile Near ATM")
-
-        oi_chart = (
-            nearest_rows[
-                ["Strike", "CE OI", "PE OI"]
+            "PE_BID", "PE_ASK", "PE_LTP", "PE_THETA", "PE_DELTA",
+            "PE_IV", "PE_VOLUME", "PE_OI_CHANGE", "PE_OI",
+        ]
+        if not mobile_compact:
+            wanted = [
+                "CE_OI", "CE_OI_CHANGE", "CE_VOLUME", "CE_IV", "CE_DELTA", "CE_GAMMA", "CE_VEGA",
+                "CE_THETA", "CE_LTP", "CE_BID", "CE_ASK",
+                "Strike",
+                "PE_BID", "PE_ASK", "PE_LTP", "PE_THETA", "PE_DELTA", "PE_GAMMA", "PE_VEGA",
+                "PE_IV", "PE_VOLUME", "PE_OI_CHANGE", "PE_OI",
             ]
-            .set_index("Strike")
-        )
+        for col in wanted:
+            if col not in display:
+                display[col] = 0.0
 
-        st.bar_chart(oi_chart, height=380)
+        rename = {
+            "CE_OI": "CE OI", "CE_OI_CHANGE": "CE Chg OI", "CE_VOLUME": "CE Vol",
+            "CE_IV": "CE IV", "CE_DELTA": "CE Δ", "CE_GAMMA": "CE Γ",
+            "CE_VEGA": "CE Vega", "CE_THETA": "CE Θ",
+            "CE_LTP": "CE LTP", "CE_BID": "CE Bid", "CE_ASK": "CE Ask",
+            "PE_BID": "PE Bid", "PE_ASK": "PE Ask", "PE_LTP": "PE LTP",
+            "PE_THETA": "PE Θ", "PE_DELTA": "PE Δ", "PE_GAMMA": "PE Γ",
+            "PE_VEGA": "PE Vega", "PE_IV": "PE IV",
+            "PE_VOLUME": "PE Vol", "PE_OI_CHANGE": "PE Chg OI", "PE_OI": "PE OI",
+        }
+        display = display[wanted].rename(columns=rename)
 
-        # ---------------- OPTION TABLE ----------------
-
-        left_title, middle_title, right_title = st.columns(
-            [8, 2, 8]
-        )
-
-        with left_title:
-            st.markdown(
-                '<div class="ce-heading">CALL SIDE — CE</div>',
-                unsafe_allow_html=True,
-            )
-
-        with middle_title:
-            st.markdown(
-                '<div class="strike-heading">STRIKE</div>',
-                unsafe_allow_html=True,
-            )
-
-        with right_title:
-            st.markdown(
-                '<div class="pe-heading">PUT SIDE — PE</div>',
-                unsafe_allow_html=True,
-            )
-
-        def highlight_levels(row):
-            strike = safe_float(row["Strike"])
-            is_atm = math.isclose(strike, safe_float(atm_strike), rel_tol=0, abs_tol=0.001)
-            is_resistance = math.isclose(strike, safe_float(resistance), rel_tol=0, abs_tol=0.001)
-            is_support = math.isclose(strike, safe_float(support), rel_tol=0, abs_tol=0.001)
-
-            if is_atm and is_resistance and is_support:
-                css = "background:linear-gradient(90deg,#ef4444 0 33%,#facc15 33% 66%,#22c55e 66% 100%);color:#111827;font-weight:950;border:3px solid #111827"
-            elif is_atm and is_resistance:
-                css = "background:linear-gradient(90deg,#ef4444 0 50%,#facc15 50% 100%);color:#111827;font-weight:950;border:3px solid #7f1d1d"
-            elif is_atm and is_support:
-                css = "background:linear-gradient(90deg,#facc15 0 50%,#22c55e 50% 100%);color:#052e16;font-weight:950;border:3px solid #166534"
-            elif is_resistance and is_support:
-                css = "background:linear-gradient(90deg,#ef4444 0 50%,#22c55e 50% 100%);color:#ffffff;font-weight:950;border:3px solid #111827"
-            elif is_resistance:
-                css = "background-color:#ef4444;color:#ffffff;font-weight:950;border-top:3px solid #7f1d1d;border-bottom:3px solid #7f1d1d"
-            elif is_support:
-                css = "background-color:#22c55e;color:#052e16;font-weight:950;border-top:3px solid #166534;border-bottom:3px solid #166534"
-            elif is_atm:
-                css = "background-color:#facc15;color:#1c1917;font-weight:950;border-top:3px solid #a16207;border-bottom:3px solid #a16207"
-            else:
-                css = ""
-            return [css] * len(row)
-
-        def emphasize_strike_column(column):
-            return [
-                "font-weight: bold; background-color: #f3f4f6"
-            ] * len(column)
-
-        render_colored_option_table(
-            nearest_rows,
-            atm_strike,
-            resistance,
-            support,
-            height=820,
-        )
-
-        st.info(
-            "🟨 Yellow Strike = ATM | "
-            "🟥 Red CE Side = Max CE OI Resistance | "
-            "🟩 Green PE Side = Max PE OI Support"
-        )
-
-        # ---------------- SIGNAL HISTORY ----------------
-
-        st.subheader("🧾 Signal History")
-
-        history_frame = pd.DataFrame(st.session_state.signal_log)
-
-        if not history_frame.empty:
-            st.dataframe(
-                history_frame.tail(100),
-                width="stretch",
-                hide_index=True,
-            )
-
-            st.download_button(
-                "⬇️ Download Signal History CSV",
-                data=history_frame.to_csv(index=False).encode("utf-8"),
-                file_name="shankar_signal_history.csv",
-                mime="text/csv",
-            )
-        else:
-            st.info("No signal history recorded yet.")
-
-        # ---------------- TRADE CHECKLIST ----------------
-
-        st.subheader("✅ Pre-Trade Checklist")
-
-        checklist_columns = st.columns(5)
-
-        checklist_columns[0].metric(
-            "Trend",
-            "Confirmed" if trend_direction in {-1, 1} else "Unavailable",
-        )
-        checklist_columns[1].metric(
-            "VWAP",
-            (
-                "Above" if spot_price > latest_vwap else "Below"
-                if latest_vwap
-                else "Unavailable"
+        display = display.rename(columns={"Strike": "STRIKE"})
+        st.dataframe(
+            option_chain_styler(
+                display,
+                safe_float(metrics["atm"], np.nan),
+                safe_float(metrics["support"], np.nan),
+                safe_float(metrics["resistance"], np.nan),
             ),
+            use_container_width=True,
+            hide_index=True,
+            height=650,
         )
-        checklist_columns[2].metric(
-            "Liquidity",
-            "Available" if buy_liquidity and sell_liquidity else "Limited",
-        )
-        checklist_columns[3].metric(
-            "Signal",
-            recommendation,
-        )
-        checklist_columns[4].metric(
-            "Risk Lot",
-            (
-                f"{allowed_lots} allowed"
-                if option_type != "WAIT"
-                else "No trade"
-            ),
+        st.caption(
+            "🟢 Support = highest Put OI • 🔴 Resistance = highest Call OI • 🟡 ATM strike. "
+            "CE/PE columns are lightly separated by colour; expanded mode also shows Gamma and Vega. "
+            "Max Pain is an approximation from available OI."
         )
 
-        # ---------------- FINAL SAFETY ----------------
 
-        st.warning(
-            "Educational analysis only. Paper trades are simulated and no real orders are placed. "
-            "Trade Quality is a rule-based score—not a validated probability. "
-            "Confirm trend, liquidity, bid/ask spread, lot size and risk before "
-            "placing any real trade."
+with backtest_tab:
+    st.markdown("### 5m Entry + 15m Confirmation Backtest")
+    st.caption(
+        "This is an underlying-direction test using the next three 5-minute candles. "
+        "It is not an options premium P&L backtest and excludes slippage, spread, brokerage and taxes."
+    )
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Signals Tested", str(backtest["trades"]))
+    b2.metric("Directional Win Rate", fmt_num(backtest["win_rate"], 1) + "%")
+    b3.metric("Average Signed Move", fmt_num(backtest["avg_move"], 3) + "%")
+    b4.metric("Profit Factor", fmt_num(backtest["profit_factor"], 2))
+    if backtest["trades"] < 30:
+        st.warning("Sample is too small for a reliable conclusion. Test at least 30–60 trading days.")
+    else:
+        st.info("Use this only for validation. Past performance does not guarantee future results.")
+
+with risk_tab:
+    st.markdown("### Position Size & Risk")
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        capital = st.number_input("Trading Capital (₹)", min_value=1000.0, value=100000.0, step=5000.0)
+    with r2:
+        risk_percent = st.number_input("Risk per trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
+    with r3:
+        lot_size = st.number_input("Lot Size", min_value=1, value=75, step=1)
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        entry_price = st.number_input("Option Entry Price (₹)", min_value=0.05, value=100.0, step=1.0)
+    with p2:
+        stop_price = st.number_input("Stop-Loss Price (₹)", min_value=0.0, value=80.0, step=1.0)
+    with p3:
+        target_rr = st.number_input("Target R multiple", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
+
+    risk_budget = capital * risk_percent / 100
+    risk_per_unit = max(entry_price - stop_price, 0)
+    risk_per_lot = risk_per_unit * lot_size
+    lots = math.floor(risk_budget / risk_per_lot) if risk_per_lot > 0 else 0
+    quantity = lots * lot_size
+    target = entry_price + risk_per_unit * target_rr
+
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Maximum Risk", f"₹{risk_budget:,.0f}")
+    q2.metric("Suggested Lots", str(lots))
+    q3.metric("Quantity", str(quantity))
+    q4.metric("Calculated Target", f"₹{target:,.2f}")
+
+    if stop_price >= entry_price:
+        st.error("For a long option setup, Stop-Loss must be below Entry Price.")
+    elif lots < 1:
+        st.warning("Risk budget is too small for one lot at this stop distance.")
+    else:
+        st.success(
+            f"At {risk_percent:.1f}% risk, {lots} lot(s) risk approximately "
+            f"₹{risk_per_lot * lots:,.0f} before slippage and charges."
         )
 
-    except requests.HTTPError as error:
-        auto_refresh = False
-        st.error(
-            "Dhan API request failed. Check whether the Access Token has "
-            f"expired and confirm Data API subscription. Details: {error}"
-        )
+with log_tab:
+    logs = pd.DataFrame(
+        [
+            ["Connection", connection.ok, connection.status_code, connection.elapsed_ms, connection.message],
+            ["Expiry List", expiry_result.ok, expiry_result.status_code, expiry_result.elapsed_ms, expiry_result.message],
+            ["Option Chain", chain_result.ok, chain_result.status_code, chain_result.elapsed_ms, chain_result.message],
+            ["5m Candles", result5.ok, result5.status_code, result5.elapsed_ms, result5.message],
+            ["15m Candles", result15.ok, result15.status_code, result15.elapsed_ms, result15.message],
+            ["India VIX", vix_result.ok, vix_result.status_code, vix_result.elapsed_ms, vix_result.message],
+        ],
+        columns=["Request", "Success", "HTTP", "Time ms", "Message"],
+    )
+    st.dataframe(logs, use_container_width=True, hide_index=True)
+    st.caption(
+        "Dhan codes: 806 = Data API not subscribed; 807 = token expired; "
+        "808/809/810 = authentication, token, or Client ID problem; "
+        "811 = invalid expiry; 813 = invalid Security ID."
+    )
 
-    except Exception as error:
-        auto_refresh = False
-        st.error(f"Full-dashboard analysis error: {error}")
-
-
-st.divider()
-
-st.write(
-    "Last refreshed:",
-    datetime.now(IST).strftime("%d-%m-%Y %I:%M:%S %p"),
+st.markdown("---")
+st.caption(
+    "V10.2 Pro Terminal is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
+    "Verify the instrument ID, expiry, liquidity, bid–ask spread, charges, and risk before any trade."
 )
-
-if auto_refresh and st.session_state.load_chain:
-    time.sleep(10)
-    st.rerun()
