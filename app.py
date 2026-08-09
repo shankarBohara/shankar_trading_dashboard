@@ -22,7 +22,6 @@ import math
 import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -243,28 +242,17 @@ div[data-baseweb="select"] > div,
 .trade-plan .big {font-size:25px;font-weight:900;color:#fff;}
 .trade-plan .small {font-size:12px;color:#b9cee8;margin-top:7px;}
 @media (max-width: 760px) {
-    .block-container {padding-left:.45rem!important;padding-right:.45rem!important;padding-top:.05rem!important;}
-    .hero {padding:2px 4px 2px!important;margin-bottom:4px!important;}
-    .hero-title {font-size:25px!important;line-height:1.05!important;letter-spacing:-.5px;}
-    .hero-sub {font-size:10px;line-height:1.35;}
-    .status-strip {justify-content:flex-start;gap:4px;margin-bottom:8px!important;}
-    .status-pill {padding:4px 7px;font-size:9px;}
+    .block-container {padding-left:.55rem!important;padding-right:.55rem!important;padding-top:.25rem!important;}
+    .hero-title {font-size:29px!important;letter-spacing:-.5px;}
+    .hero-sub {font-size:11px;}
+    .status-strip {justify-content:flex-start;gap:5px;}
+    .status-pill {padding:5px 8px;font-size:10px;}
     .metric-card {min-height:112px;padding:13px;border-radius:14px;}
     .metric-card .value {font-size:20px;}
     .decision-card {padding:15px;}
     .decision-value {font-size:22px;}
     .section-title {font-size:20px;}
-    div[data-testid="stButton"] button {min-height:38px!important;padding:.25rem .4rem!important;font-size:12px!important;}
 }
-/* Mobile-safe controls: keep unselected index buttons dark and readable. */
-.stButton > button[kind="secondary"], .stButton > button[data-testid="baseButton-secondary"] {
-    background:linear-gradient(145deg,#0b2a55,#0a2144)!important;
-    color:#f7fbff!important;
-    border:1px solid rgba(151,199,255,.28)!important;
-}
-.stButton > button[kind="secondary"] p, .stButton > button[data-testid="baseButton-secondary"] p {color:#f7fbff!important;}
-/* Remove Streamlit chrome that crowds small phone screens. */
-[data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"], #MainMenu, footer {display:none!important;visibility:hidden!important;}
 
 .level-grid {
     display:grid;
@@ -559,14 +547,12 @@ def compact_num(value: Any) -> str:
     return f"{x:.0f}"
 
 
-IST = ZoneInfo("Asia/Kolkata")
-
 def now_ist_text() -> str:
-    return datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p")
+    return datetime.now().strftime("%d %b %Y, %I:%M:%S %p")
 
 
 def is_market_open() -> tuple[bool, str]:
-    now = datetime.now(IST)
+    now = datetime.now()
     weekday = now.weekday() < 5
     session = time(9, 15) <= now.time() <= time(15, 30)
     if weekday and session:
@@ -1781,58 +1767,65 @@ for extra_name in ("SENSEX", "BANKEX"):
     if extra_name in discovered_indices:
         AVAILABLE_MARKETS[extra_name] = discovered_indices[extra_name]
 
-with st.sidebar:
-    st.header("🔐 Dhan Connection")
+# Compact Dhan login popup for desktop + mobile.
+# Credentials are intentionally kept out of the main dashboard until the lock icon is opened.
+client_id = read_secret("DHAN_CLIENT_ID", str(config.get("client_id", "")))
+access_token = read_secret("DHAN_ACCESS_TOKEN", str(config.get("access_token", "")))
+validate_clicked = False
 
-    client_id = st.text_input(
-        "Dhan Client ID",
-        value=read_secret("DHAN_CLIENT_ID", str(config.get("client_id", ""))),
-        placeholder="Example: 1100xxxxxx",
-    )
-    access_token = st.text_area(
-        "Dhan Access Token",
-        value=read_secret("DHAN_ACCESS_TOKEN", str(config.get("access_token", ""))),
-        height=150,
-        placeholder="Paste the current 24-hour token",
-    )
+login_col, _login_spacer = st.columns([1, 12])
+with login_col:
+    with st.popover("🔐", help="Open Dhan Client ID / Access Token"):
+        st.markdown("### Dhan Connection")
+        client_id = st.text_input(
+            "Dhan Client ID",
+            value=client_id,
+            placeholder="Example: 1100xxxxxx",
+            key="popup_dhan_client_id",
+        )
+        access_token = st.text_area(
+            "Dhan Access Token",
+            value=access_token,
+            height=150,
+            placeholder="Paste the current Dhan access token",
+            key="popup_dhan_access_token",
+        )
+        p1, p2 = st.columns(2)
+        with p1:
+            save_clicked = st.button("💾 Save", use_container_width=True, key="popup_save_dhan")
+        with p2:
+            validate_clicked = st.button("✅ Connect", use_container_width=True, key="popup_connect_dhan")
 
-    s1, s2 = st.columns(2)
-    with s1:
-        save_clicked = st.button("💾 Save", use_container_width=True)
-    with s2:
-        validate_clicked = st.button("✅ Connect Live", use_container_width=True)
+        if save_clicked:
+            if client_id.strip() and access_token.strip():
+                config["client_id"] = client_id.strip()
+                config["access_token"] = access_token.strip()
+                save_config(config)
+                st.success("Credentials saved.")
+            else:
+                st.warning("Enter Client ID and Access Token.")
 
-    if save_clicked:
-        if client_id.strip() and access_token.strip():
-            config["client_id"] = client_id.strip()
-            config["access_token"] = access_token.strip()
+        if validate_clicked:
+            if client_id.strip() and access_token.strip():
+                config["client_id"] = client_id.strip()
+                config["access_token"] = access_token.strip()
+                save_config(config)
+                st.session_state.live_enabled = True
+                st.cache_data.clear()
+            else:
+                st.session_state.live_enabled = False
+                st.warning("Enter Client ID and Access Token.")
+
+        if st.button("🗑 Clear Token", use_container_width=True, key="popup_clear_dhan"):
+            config["client_id"] = ""
+            config["access_token"] = ""
             save_config(config)
-            st.success("Credentials saved on this computer.")
-        else:
-            st.warning("Enter Client ID and Access Token.")
-
-    if validate_clicked:
-        if client_id.strip() and access_token.strip():
-            # Save first, then keep live mode enabled across all later reruns.
-            config["client_id"] = client_id.strip()
-            config["access_token"] = access_token.strip()
-            save_config(config)
-            st.session_state.live_enabled = True
-            st.cache_data.clear()
-        else:
             st.session_state.live_enabled = False
-            st.warning("Enter Client ID and Access Token.")
+            st.cache_data.clear()
+            st.success("Token cleared.")
 
-    if st.button("🗑 Clear Token", use_container_width=True):
-        config["client_id"] = ""
-        config["access_token"] = ""
-        save_config(config)
-        st.session_state.live_enabled = False
-        st.cache_data.clear()
-        st.success("Token cleared. Refresh once.")
-
-    st.divider()
-    st.subheader("⚙️ Market Setup")
+with st.sidebar:
+    st.header("⚙️ Market Setup")
     if discovered_indices:
         st.caption(f"Official Dhan master: {len(discovered_indices)} index mappings resolved.")
     else:
@@ -1986,20 +1979,17 @@ st.markdown(
 # Real clickable index selector. V9 used decorative HTML chips, which could never
 # change the selected market. Button callbacks update Session State before rerun.
 market_names = list(AVAILABLE_MARKETS.keys())
-# Phone-friendly 2-column selector. Streamlit stacks a 6-column row vertically on
-# narrow screens; pairing buttons keeps all indices compact and readable.
-for row_start in range(0, len(market_names), 2):
-    market_cols = st.columns(2, gap="small")
-    for col, name in zip(market_cols, market_names[row_start:row_start + 2]):
-        with col:
-            st.button(
-                name,
-                key=f"market_btn_{name}",
-                type="primary" if name == selected_market else "secondary",
-                use_container_width=True,
-                on_click=select_market_from_button,
-                args=(name,),
-            )
+market_cols = st.columns(len(market_names))
+for col, name in zip(market_cols, market_names):
+    with col:
+        st.button(
+            name,
+            key=f"market_btn_{name}",
+            type="primary" if name == selected_market else "secondary",
+            use_container_width=True,
+            on_click=select_market_from_button,
+            args=(name,),
+        )
 
 if st.session_state.last_validation_message:
     if connection.ok and st.session_state.live_enabled:
