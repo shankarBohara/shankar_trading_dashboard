@@ -69,7 +69,7 @@ st.set_page_config(
     page_title=APP_NAME,
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ---------------------------------------------------------------------
@@ -78,6 +78,12 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+/* V10.3 popup-clean: keep Market Setup logic alive but hide the Streamlit sidebar UI.
+   Dhan credentials are entered only from the lock popover in the main dashboard. */
+[data-testid="stSidebar"] {display:none !important;}
+[data-testid="collapsedControl"] {display:none !important;}
+button[kind="header"] {display:none !important;}
+
 :root {
     --bg-1:#041124;
     --bg-2:#071d3d;
@@ -1773,7 +1779,7 @@ client_id = read_secret("DHAN_CLIENT_ID", str(config.get("client_id", "")))
 access_token = read_secret("DHAN_ACCESS_TOKEN", str(config.get("access_token", "")))
 validate_clicked = False
 
-login_col, _login_spacer = st.columns([1, 12])
+login_col, _login_spacer = st.columns([0.7, 11.3])
 with login_col:
     with st.popover("🔐", help="Open Dhan Client ID / Access Token"):
         st.markdown("### Dhan Connection")
