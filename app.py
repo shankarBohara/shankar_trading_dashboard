@@ -6,7 +6,7 @@ Install once:
     py -m pip install streamlit requests pandas numpy plotly
 
 Run:
-    py -m streamlit run shankar_trading_dashboard_v4_pro.py
+    py -m streamlit run shankar_trading_dashboard_v11_5.py
 
 Important:
 - This version does NOT place real-money orders.
@@ -26,6 +26,7 @@ import hmac
 import struct
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +45,11 @@ except Exception:
 # APP CONFIG
 # ---------------------------------------------------------------------
 APP_NAME = "Shankar Trading Dashboard"
-APP_VERSION = "V11.3 Research Fusion Pro"
+APP_VERSION = "V11.5 Pro Fusion Explainable"
 DHAN_BASE = "https://api.dhan.co/v2"
 DHAN_AUTH_BASE = "https://auth.dhan.co/app"
 AUTO_RENEW_BEFORE_MINUTES = 60
+IST = ZoneInfo("Asia/Kolkata")
 CONFIG_PATH = Path(__file__).with_name(".shankar_dashboard_config.json")
 REQUEST_TIMEOUT = 10
 DHAN_INSTRUMENT_MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -553,16 +555,27 @@ def compact_num(value: Any) -> str:
     return f"{x:.0f}"
 
 
+def now_ist() -> datetime:
+    """Always use Indian Standard Time, including on Streamlit Cloud servers."""
+    return datetime.now(IST)
+
+
 def now_ist_text() -> str:
-    return datetime.now().strftime("%d %b %Y, %I:%M:%S %p")
+    return now_ist().strftime("%d %b %Y, %I:%M:%S %p IST")
 
 
 def is_market_open() -> tuple[bool, str]:
-    now = datetime.now()
-    weekday = now.weekday() < 5
-    session = time(9, 15) <= now.time() <= time(15, 30)
-    if weekday and session:
+    """Normal NSE/BSE trading-session gate in IST.
+
+    Weekends and normal session hours are enforced. Exchange holidays are not guessed.
+    """
+    now = now_ist()
+    if now.weekday() >= 5:
+        return False, "Market Closed — Weekend"
+    if time(9, 15) <= now.time() <= time(15, 30):
         return True, "Market Open"
+    if now.time() < time(9, 15):
+        return False, "Market Closed — Pre-open"
     return False, "Market Closed"
 
 
@@ -1408,37 +1421,82 @@ def final_decision(
 
 
 
-def research_fusion_decision(sig5: dict[str, Any], sig15: dict[str, Any], metrics: dict[str, Any], flow: dict[str, Any], india_vix: float = np.nan) -> dict[str, Any]:
-    """V11.3: confirmation-first fusion. 5m executes; 15m confirms; option flow can confirm/veto.
-    Designed to reduce false positives, not to predict or guarantee returns.
-    """
-    base = final_decision(sig5, sig15, metrics)
+def market_regime(df5: pd.DataFrame, sig5: dict[str, Any], sig15: dict[str, Any]) -> dict[str, Any]:
+    """Classify intraday environment using only 5m execution data and 15m confirmation."""
+    out = {"name":"Unknown","score":50,"direction":"Neutral","reason":"Insufficient data"}
+    if df5.empty or len(df5) < 25 or not sig5.get("available") or not sig15.get("available"):
+        return out
+    row = df5.iloc[-1]
+    close = safe_float(row.get("close"), np.nan); atr = safe_float(row.get("atr"), np.nan)
+    vwap = safe_float(row.get("vwap"), np.nan); ema9 = safe_float(row.get("ema9"), np.nan); ema21 = safe_float(row.get("ema21"), np.nan)
+    if not all(math.isfinite(v) for v in (close,atr,vwap,ema9,ema21)) or close <= 0:
+        return out
+    atr_pct = atr / close * 100
+    ema_gap_pct = abs(ema9-ema21) / close * 100
+    vwap_gap_atr = abs(close-vwap) / max(atr,1e-9)
+    aligned = sig5.get("trend") == sig15.get("trend") and sig5.get("trend") in ("Bullish","Bearish")
+    if aligned and ema_gap_pct >= 0.05 and vwap_gap_atr >= 0.18:
+        direction = sig5["trend"]
+        strength = min(100, int(round(60 + min(25, ema_gap_pct*250) + min(15, vwap_gap_atr*8))))
+        return {"name":f"Trending {direction}","score":strength,"direction":direction,"reason":f"5m/15m aligned • EMA separation {ema_gap_pct:.2f}% • ATR {atr_pct:.2f}%"}
+    if atr_pct >= 0.55:
+        return {"name":"High-Volatility Chop","score":35,"direction":"Neutral","reason":f"ATR elevated ({atr_pct:.2f}% of spot) without clean alignment"}
+    return {"name":"Range / Transition","score":45,"direction":"Neutral","reason":"Trend alignment/separation is not strong enough for a clean premium-buying regime"}
+
+
+def entry_chase_filter(df5: pd.DataFrame, sig5: dict[str, Any], bullish: bool) -> dict[str, Any]:
+    """Reject extended 5m entries so the engine does not buy premium after the move."""
+    out={"ok":True,"reason":"Entry location acceptable","distance_atr":np.nan,"body_atr":np.nan}
+    if df5.empty or len(df5)<3: return out
+    row=df5.iloc[-1]; atr=max(safe_float(row.get("atr"),0),1e-9)
+    close=safe_float(row.get("close"),np.nan); open_=safe_float(row.get("open"),np.nan); vwap=safe_float(row.get("vwap"),np.nan)
+    if not all(math.isfinite(v) for v in (close,open_,vwap)): return out
+    distance_atr=abs(close-vwap)/atr; body_atr=abs(close-open_)/atr; rsi=safe_float(sig5.get("rsi"),np.nan)
+    if distance_atr>1.35: return {"ok":False,"reason":f"Price is {distance_atr:.2f} ATR from VWAP — avoid chasing","distance_atr":distance_atr,"body_atr":body_atr}
+    if body_atr>1.10: return {"ok":False,"reason":f"Latest 5m candle body is {body_atr:.2f} ATR — wait for retest","distance_atr":distance_atr,"body_atr":body_atr}
+    if math.isfinite(rsi) and ((bullish and rsi>=76) or ((not bullish) and rsi<=24)):
+        return {"ok":False,"reason":f"5m RSI {rsi:.1f} is stretched — wait for reset/retest","distance_atr":distance_atr,"body_atr":body_atr}
+    out.update({"distance_atr":distance_atr,"body_atr":body_atr}); return out
+
+
+def pro_fusion_decision(sig5: dict[str, Any], sig15: dict[str, Any], metrics: dict[str, Any], flow: dict[str, Any], regime: dict[str, Any], chase: dict[str, Any], market_open: bool, india_vix: float=np.nan) -> dict[str, Any]:
+    """V11.5: 45% 5m + 30% 15m + 15% option flow + 10% regime, with hard safety gates."""
     if not sig5.get("available") or not sig15.get("available"):
-        return base
-    aligned = sig5.get("trend") == sig15.get("trend") and sig5.get("trend") in ("Bullish", "Bearish")
+        return {"action":"WAIT — DATA NOT CONNECTED","confidence":0,"bias":"Neutral","css":"","reason":"Valid 5m and 15m candles are required.","checks":[]}
+    aligned=sig5.get("trend")==sig15.get("trend") and sig5.get("trend") in ("Bullish","Bearish")
     if not aligned:
-        base.update({"action":"WAIT — TIMEFRAMES NOT ALIGNED", "confidence":min(int(base.get("confidence",0)),79), "css":"", "reason":"V11.3 requires 5m execution and 15m trend alignment before a setup."})
-        return base
-    bullish = sig5["trend"] == "Bullish"
-    tech = sig5["score"] * 0.50 + sig15["score"] * 0.35
-    option_component = (flow.get("flow_score",50) if bullish else 100-flow.get("flow_score",50)) * 0.15
-    confidence = int(max(0,min(100,round(tech + option_component))))
-    # Hard conflict veto. Option-chain evidence is confirmation, never a stand-alone trigger.
-    conflict = (bullish and flow.get("flow_score",50) <= 42) or ((not bullish) and flow.get("flow_score",50) >= 58)
-    # Avoid chasing extremely stretched RSI; keep it a wait condition rather than reverse signal.
-    rsi5 = safe_float(sig5.get("rsi"), np.nan)
-    stretched = math.isfinite(rsi5) and ((bullish and rsi5 >= 76) or ((not bullish) and rsi5 <= 24))
-    if conflict:
-        action = "WAIT — OPTION FLOW CONFLICT"; css=""; reason="Trend aligns, but live option flow conflicts with the direction."
-    elif stretched:
-        action = "WAIT — RSI STRETCHED"; css=""; reason="Trend aligns, but 5m RSI is stretched; wait for a cleaner entry/retest."
-    elif confidence >= 80:
-        action = "BUY CE SETUP" if bullish else "BUY PE SETUP"; css="buy" if bullish else "sell"; reason="V11.3 research-fusion confirmation passed: 5m + 15m alignment with supportive option flow."
-    elif confidence >= 70:
-        action = "WAIT FOR BULLISH CONFIRMATION" if bullish else "WAIT FOR BEARISH CONFIRMATION"; css=""; reason="Directional alignment exists, but fused confidence is below the 80% entry rule."
-    else:
-        action="NO TRADE"; css=""; reason="V11.3 fused evidence is below the minimum quality threshold."
-    return {"action":action,"confidence":confidence,"bias":"Bullish" if bullish else "Bearish","css":css,"reason":reason}
+        return {"action":"WAIT — TIMEFRAMES NOT ALIGNED","confidence":min(79,max(sig5.get("score",0),100-sig5.get("score",0))),"bias":"Mixed","css":"","reason":"5m execution and 15m confirmation disagree or are sideways.","checks":["5m/15m alignment ✗"]}
+    bullish=sig5["trend"]=="Bullish"
+    tech5=sig5["score"] if bullish else 100-sig5["score"]; tech15=sig15["score"] if bullish else 100-sig15["score"]
+    flow_dir=safe_float(flow.get("flow_score"),50) if bullish else 100-safe_float(flow.get("flow_score"),50)
+    regime_dir=safe_float(regime.get("score"),50) if regime.get("direction")==sig5["trend"] else 40
+    component_5m = tech5 * 0.45
+    component_15m = tech15 * 0.30
+    component_flow = flow_dir * 0.15
+    component_regime = regime_dir * 0.10
+    confidence=int(max(0,min(100,round(component_5m+component_15m+component_flow+component_regime))))
+    flow_conflict=(bullish and safe_float(flow.get("flow_score"),50)<=42) or ((not bullish) and safe_float(flow.get("flow_score"),50)>=58)
+    regime_bad=regime.get("name") in ("High-Volatility Chop","Range / Transition") and confidence<88
+    checks=[f"5m {sig5['trend']} ✓",f"15m {sig15['trend']} ✓",f"Option flow {flow.get('flow_bias','Neutral')} ({flow.get('flow_score',50)}%) {'✗' if flow_conflict else '✓'}",f"Regime {regime.get('name','Unknown')} {'△' if regime_bad else '✓'}",f"Entry location {'✓' if chase.get('ok',True) else '✗'}",f"Market session {'✓' if market_open else '✗'}"]
+    breakdown = {
+        "5m": round(component_5m, 1),
+        "15m": round(component_15m, 1),
+        "flow": round(component_flow, 1),
+        "regime": round(component_regime, 1),
+        "raw_5m": int(round(tech5)),
+        "raw_15m": int(round(tech15)),
+        "raw_flow": int(round(flow_dir)),
+        "raw_regime": int(round(regime_dir)),
+    }
+    common={"confidence":confidence,"bias":"Bullish" if bullish else "Bearish","css":"","checks":checks,"breakdown":breakdown}
+    if not market_open: return {**common,"action":"MARKET CLOSED — NO FRESH ENTRY","reason":"Analysis can remain visible, but V11.5 blocks fresh entries outside the normal Indian session."}
+    if flow_conflict: return {**common,"action":"WAIT — OPTION FLOW CONFLICT","confidence":min(confidence,79),"reason":"Trend aligns, but option-chain flow conflicts with the direction."}
+    if not chase.get("ok",True): return {**common,"action":"WAIT — DO NOT CHASE","confidence":min(confidence,79),"reason":chase.get("reason","Entry is extended.")}
+    if regime_bad: return {**common,"action":"WAIT — MARKET REGIME WEAK","confidence":min(confidence,79),"reason":"Range/chop detected; premium buying needs exceptional evidence."}
+    if confidence>=80: return {**common,"action":"BUY CE SETUP" if bullish else "BUY PE SETUP","css":"buy" if bullish else "sell","reason":"V11.5 Pro Fusion passed trend, flow, regime and entry-location gates."}
+    if confidence>=70: return {**common,"action":"WAIT FOR BULLISH CONFIRMATION" if bullish else "WAIT FOR BEARISH CONFIRMATION","reason":"Alignment exists, but fused confidence is below 80%."}
+    return {**common,"action":"NO TRADE","reason":"Evidence is below V11.5 minimum quality threshold."}
+
 
 def option_flow_intelligence(df: pd.DataFrame, spot: float | None, metrics: dict[str, Any]) -> dict[str, Any]:
     """Compact option-flow readout using OI, OI change, volume, IV and ATM straddle."""
@@ -1520,22 +1578,32 @@ def select_best_option_contract(
         oi = safe_float(row.get(f"{side}_OI"), 0)
         iv = safe_float(row.get(f"{side}_IV"), np.nan)
         delta = abs(safe_float(row.get(f"{side}_DELTA"), np.nan))
+        theta = abs(safe_float(row.get(f"{side}_THETA"), np.nan))
+        strike = safe_float(row.get("Strike"), np.nan)
         if ltp <= 0:
             continue
         spread = ((ask - bid) / max((ask + bid) / 2, 0.01) * 100) if ask > 0 and bid > 0 and ask >= bid else 99.0
+        theta_ratio = theta / ltp if math.isfinite(theta) and ltp > 0 else np.nan
         score = 0.0
         score += max(0, 30 - min(spread, 10) * 5)
         score += min(20, math.log10(max(volume, 1)) * 5)
         score += min(20, math.log10(max(oi, 1)) * 4)
         if math.isfinite(delta):
-            score += max(0, 20 - abs(delta - 0.50) * 50)
-        if math.isfinite(iv) and 5 <= iv <= 80:
+            score += max(0, 20 - abs(delta - 0.52) * 55)
+        if math.isfinite(iv) and 5 <= iv <= 100:
             score += 5
+        # Prefer ATM/slightly ITM over cheap far-OTM premium buying.
+        is_itm_or_atm = (side == "CE" and strike <= atm + 1e-9) or (side == "PE" and strike >= atm - 1e-9)
+        score += 5 if is_itm_or_atm else 0
+        if math.isfinite(theta_ratio):
+            score += 5 if theta_ratio <= 0.08 else max(0, 5 - (theta_ratio - 0.08) * 40)
         score += max(0, 5 - safe_float(row.get("_distance"), 0) / max(step, 1) * 2.5)
-        candidate = {"ok": spread <= 4.0 and volume >= 100 and oi >= 500,
-                     "strike": safe_float(row.get("Strike"), np.nan), "entry": ltp, "score": int(round(score)),
-                     "spread_pct": spread, "delta": delta, "iv": iv, "volume": volume, "oi": oi,
-                     "reason": f"quality {score:.0f}/100 • spread {spread:.1f}% • vol {compact_num(volume)} • OI {compact_num(oi)}"}
+        delta_ok = (not math.isfinite(delta)) or (0.35 <= delta <= 0.75)
+        theta_ok = (not math.isfinite(theta_ratio)) or theta_ratio <= 0.15
+        candidate = {"ok": spread <= 3.5 and volume >= 250 and oi >= 750 and delta_ok and theta_ok,
+                     "strike": strike, "entry": ltp, "score": int(round(score)),
+                     "spread_pct": spread, "delta": delta, "iv": iv, "theta_ratio": theta_ratio, "volume": volume, "oi": oi,
+                     "reason": f"quality {score:.0f}/100 • spread {spread:.1f}% • Δ {fmt_num(delta,2)} • theta/premium {fmt_num(theta_ratio*100 if math.isfinite(theta_ratio) else np.nan,1)}% • vol {compact_num(volume)} • OI {compact_num(oi)}"}
         if best is None or candidate["score"] > best["score"]:
             best = candidate
     return best or empty
@@ -1716,16 +1784,50 @@ def build_trade_plan(
         "t2": np.nan,
         "t3": np.nan,
         "rr": "—",
-        "note": "No trade plan until both timeframes align and confidence reaches 80%.",
+        "note": "Waiting for a valid setup.",
     }
     action = str(decision.get("action", ""))
-    if chain.empty or not (action.startswith("BUY CE") or action.startswith("BUY PE")):
+    confidence = int(safe_float(decision.get("confidence"), 0))
+    reason = str(decision.get("reason", "")).strip()
+
+    if action.startswith("MARKET CLOSED"):
+        plan["note"] = "MARKET CLOSED — No fresh entry. " + (reason or "Fresh entries are blocked outside normal Indian market hours.")
+        return plan
+    if action.startswith("WAIT — TIMEFRAMES NOT ALIGNED"):
+        plan["note"] = "WAIT — 5-minute execution and 15-minute trend confirmation are not aligned."
+        return plan
+    if action.startswith("WAIT — OPTION FLOW CONFLICT"):
+        plan["note"] = "WAIT — Option-chain flow conflicts with the 5m/15m direction."
+        return plan
+    if action.startswith("WAIT — DO NOT CHASE"):
+        plan["note"] = "WAIT — " + (reason or "Entry is extended; wait for a retest.")
+        return plan
+    if action.startswith("WAIT — MARKET REGIME WEAK"):
+        plan["note"] = "WAIT — Market regime is range/choppy; premium buying quality is insufficient."
+        return plan
+    if action.startswith("WAIT — LIQUIDITY BLOCK"):
+        plan["note"] = "WAIT — " + (reason or "Option liquidity/spread quality is insufficient.")
+        return plan
+    if action.startswith("WAIT FOR"):
+        plan["note"] = f"WAIT — Timeframes are aligned, but fused confidence is {confidence}% (minimum 80% required)."
+        return plan
+    if action.startswith("NO TRADE"):
+        plan["note"] = f"NO TRADE — Confidence is {confidence}% and evidence is below the minimum quality threshold."
+        return plan
+    if action.startswith("WAIT — DATA NOT CONNECTED"):
+        plan["note"] = "WAIT — Valid live 5-minute and 15-minute data are required."
+        return plan
+    if chain.empty:
+        plan["note"] = "WAIT — Option-chain data is unavailable, so a contract cannot be selected."
+        return plan
+    if not (action.startswith("BUY CE") or action.startswith("BUY PE")):
+        plan["note"] = reason or "WAIT — No eligible setup."
         return plan
 
     side = "CE" if action.startswith("BUY CE") else "PE"
     contract = select_best_option_contract(chain, side, metrics)
     if not contract.get("ok"):
-        plan["note"] = "V11.3 blocked contract: " + str(contract.get("reason", "weak liquidity/quality"))
+        plan["note"] = "V11.5 blocked contract: " + str(contract.get("reason", "weak liquidity/quality"))
         return plan
     entry = safe_float(contract.get("entry"), np.nan)
     if not math.isfinite(entry) or entry <= 0:
@@ -1749,7 +1851,7 @@ def build_trade_plan(
             "t2": entry + 2 * risk,
             "t3": entry + 3 * risk,
             "rr": "1:3",
-            "note": "V11.1 selected liquid near-ATM contract • " + str(contract.get("reason", "")) + ". Confirm 5m candle close before entry.",
+            "note": "V11.5 selected liquid near-ATM contract • " + str(contract.get("reason", "")) + ". Confirm 5m candle close before entry.",
         }
     )
     return plan
@@ -2010,12 +2112,9 @@ with st.sidebar:
         value=True,
         help="Renews an active Web token before expiry. Optional TOTP fallback can generate a fresh 24-hour token.",
     )
-    renew_before_minutes = st.select_slider(
-        "Renew before expiry",
-        options=[15, 30, 45, 60, 90, 120],
-        value=AUTO_RENEW_BEFORE_MINUTES,
-        format_func=lambda x: f"{x} min",
-    )
+    # V11.5: keep token-renew timing automatic so no misleading "60 min" label appears in the trading UI.
+    renew_before_minutes = AUTO_RENEW_BEFORE_MINUTES
+    st.caption("Token renewal timing is managed automatically before expiry.")
     dhan_pin = st.text_input(
         "Dhan PIN (optional TOTP fallback)",
         value=read_secret("DHAN_PIN", ""),
@@ -2390,7 +2489,10 @@ metrics = option_metrics(df_chain, spot)
 flow = option_flow_intelligence(df_chain, spot, metrics)
 oi_levels = option_oi_levels(df_chain, spot)
 structure_levels = price_structure_levels(df5, df15, spot)
-decision = research_fusion_decision(sig5, sig15, metrics, flow, india_vix)
+regime = market_regime(df5, sig5, sig15)
+_direction_bullish = sig5.get("trend") != "Bearish"
+chase = entry_chase_filter(df5, sig5, _direction_bullish)
+decision = pro_fusion_decision(sig5, sig15, metrics, flow, regime, chase, market_open, india_vix)
 pivots = calculate_pivots(df15 if not df15.empty else df5)
 liquidity = liquidity_filter(df_chain, metrics)
 backtest = simple_backtest(df5, df15)
@@ -2398,15 +2500,11 @@ trade_plan = build_trade_plan(decision, df_chain, metrics, sig5)
 
 if trade_plan["side"] != "WAIT" and not liquidity["ok"]:
     trade_plan["side"] = "WAIT"
-    trade_plan["note"] = liquidity["reason"] + ". Trade blocked by V11.3 liquidity/data-quality filter."
-
-if not market_open and decision["action"].startswith("BUY"):
-    decision["action"] = "MARKET CLOSED — LAST DATA ONLY"
-    decision["css"] = ""
-    decision["reason"] = "Signals are historical snapshots. New live entry is disabled outside market hours."
+    trade_plan["note"] = liquidity["reason"] + ". Trade blocked by V11.5 liquidity/data-quality gate."
+    decision.update({"action":"WAIT — LIQUIDITY BLOCK","css":"","confidence":min(decision.get("confidence",0),79),"reason":liquidity["reason"]})
 
 # ---------------------------------------------------------------------
-# V11.1 PRO TERMINAL SUMMARY — ONLY 5m EXECUTION + 15m TREND
+# V11.5 PRO FUSION SUMMARY — ONLY 5m EXECUTION + 15m TREND
 # ---------------------------------------------------------------------
 aligned = sig5["trend"] == sig15["trend"] and sig5["trend"] in ("Bullish", "Bearish")
 alignment_text = sig5["trend"] if aligned else "Mixed"
@@ -2465,7 +2563,7 @@ else:
 
 st.markdown(
     f"""
-<div class="note-box"><b>V11.3 Research Fusion:</b> Flow <b>{flow['flow_bias']} ({flow['flow_score']}%)</b> • ATM Straddle <b>₹{fmt_num(flow['atm_straddle'],2)}</b> • Premium-implied move <b>{fmt_num(flow['expected_move_pct'],2)}%</b> • Put Vol {compact_num(flow['put_volume'])} vs Call Vol {compact_num(flow['call_volume'])}. Contract selection now ranks near-ATM strikes by spread, volume, OI, Delta and IV.</div>
+<div class="note-box"><b>V11.5 Research Fusion:</b> Flow <b>{flow['flow_bias']} ({flow['flow_score']}%)</b> • ATM Straddle <b>₹{fmt_num(flow['atm_straddle'],2)}</b> • Premium-implied move <b>{fmt_num(flow['expected_move_pct'],2)}%</b> • Put Vol {compact_num(flow['put_volume'])} vs Call Vol {compact_num(flow['call_volume'])}. Contract selection now ranks near-ATM strikes by spread, volume, OI, Delta and IV.</div>
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------
@@ -2539,6 +2637,20 @@ with overview_tab:
         unsafe_allow_html=True,
     )
 
+    st.markdown("### 🧠 V11.5 Why BUY / Why WAIT")
+    checklist_text = " • ".join(decision.get("checks", [])) if decision.get("checks") else "Waiting for complete live data."
+    bd = decision.get("breakdown", {})
+    if bd:
+        breakdown_text = (
+            f"5m {bd.get('raw_5m',0)} ×45% = {bd.get('5m',0)} • "
+            f"15m {bd.get('raw_15m',0)} ×30% = {bd.get('15m',0)} • "
+            f"Flow {bd.get('raw_flow',0)} ×15% = {bd.get('flow',0)} • "
+            f"Regime {bd.get('raw_regime',0)} ×10% = {bd.get('regime',0)}"
+        )
+    else:
+        breakdown_text = "Score breakdown available after aligned live data is loaded."
+    st.markdown(f"""<div class="note-box"><b>{decision['action']} — {decision['confidence']}%</b><br>{decision['reason']}<br><br><b>Confidence breakdown:</b> {breakdown_text}<br><br><b>Checks:</b> {checklist_text}<br><b>Regime:</b> {regime.get('name','Unknown')} — {regime.get('reason','')}</div>""", unsafe_allow_html=True)
+
     st.markdown("### Signal Checklist")
     trend5_class = "signal-bull" if sig5["trend"] == "Bullish" else "signal-bear" if sig5["trend"] == "Bearish" else "signal-gold"
     trend15_class = "signal-bull" if sig15["trend"] == "Bullish" else "signal-bear" if sig15["trend"] == "Bearish" else "signal-gold"
@@ -2559,9 +2671,7 @@ with overview_tab:
     st.markdown(
         """
 <div class="note-box">
-<b>Decision rules:</b> 80% and above = eligible BUY CE/BUY PE setup;
-70–79% = WAIT for confirmation; below 70% = NO TRADE.
-A signal is blocked when 5-minute and 15-minute trends do not agree.
+<b>V11.5 Decision rules:</b> 80%+ = eligible BUY setup; 70–79% = WAIT; below 70% = NO TRADE. Hard gates still block a high score when market is closed, 5m/15m disagree, option flow conflicts, liquidity is weak, regime is choppy, or the 5m entry is extended.
 </div>
 """,
         unsafe_allow_html=True,
@@ -2575,8 +2685,8 @@ with trade_tab:
         st.markdown(
             """
 <div class="note-box">
-The dashboard intentionally blocks a trade when 5-minute and 15-minute signals disagree,
-when confidence is below 80%, or when live premium data is unavailable.
+V11.5 shows the exact blocking reason above: market session, timeframe alignment, confidence,
+option-flow conflict, market regime, entry-chase protection, liquidity, or missing live option data.
 </div>
 """,
             unsafe_allow_html=True,
@@ -2764,6 +2874,6 @@ with log_tab:
 
 st.markdown("---")
 st.caption(
-    "V11.3 Research Fusion Pro is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
+    "V11.5 Research Fusion Pro is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
     "Verify the instrument ID, expiry, liquidity, bid–ask spread, charges, and risk before any trade."
 )
