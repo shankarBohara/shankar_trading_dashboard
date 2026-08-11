@@ -45,10 +45,11 @@ except Exception:
 # APP CONFIG
 # ---------------------------------------------------------------------
 APP_NAME = "Shankar Trading Dashboard"
-APP_VERSION = "V11.5 Pro Fusion Explainable"
+APP_VERSION = "V11.6 Pro Fusion Explainable"
 DHAN_BASE = "https://api.dhan.co/v2"
 DHAN_AUTH_BASE = "https://auth.dhan.co/app"
 AUTO_RENEW_BEFORE_MINUTES = 60
+TOTP_GENERATE_COOLDOWN_SECONDS = 125  # Dhan documents a 2-minute generation guard
 IST = ZoneInfo("Asia/Kolkata")
 CONFIG_PATH = Path(__file__).with_name(".shankar_dashboard_config.json")
 REQUEST_TIMEOUT = 10
@@ -590,15 +591,20 @@ def read_secret(name: str, default: str = "") -> str:
 
 
 def classify_api_error(result: ApiResult) -> str:
+    """Normalize both legacy and current Dhan authentication/data errors."""
     message = str(result.message or "")
     raw = f"{message} {result.data}".upper()
     if any(code in raw for code in ("807", "TOKEN EXPIRED", "EXPIRED TOKEN")):
         return "TOKEN_EXPIRED"
-    if any(code in raw for code in ("808", "809", "810", "UNAUTHORIZED", "AUTHENTICATION")):
+    if any(code in raw for code in (
+        "DH-901", "INVALID_AUTHENTICATION", "INVALID AUTHENTICATION",
+        "INVALID TOKEN", "ACCESS TOKEN IS INVALID", "UNAUTHORIZED",
+        "808", "809", "810", "AUTHENTICATION",
+    )) or result.status_code in (401, 403):
         return "AUTH_ERROR"
-    if "806" in raw or "DATA API" in raw and "SUBSCR" in raw:
+    if "806" in raw or ("DATA API" in raw and "SUBSCR" in raw):
         return "DATA_SUBSCRIPTION"
-    if "DH-904" in raw or "TOO MANY REQUEST" in raw or result.status_code == 429:
+    if any(code in raw for code in ("DH-904", "DH-905", "TOO MANY REQUEST", "RATE LIMIT")) or result.status_code == 429:
         return "RATE_LIMIT"
     return "OTHER"
 
@@ -741,7 +747,7 @@ def save_config(config: dict[str, Any]) -> None:
 
 
 def _jwt_expiry(access_token: str) -> datetime | None:
-    """Read JWT exp without verifying the signature; used only for local expiry timing."""
+    """Read JWT exp without verifying signature; timing only, never authentication."""
     try:
         parts = access_token.strip().split(".")
         if len(parts) < 2:
@@ -751,7 +757,7 @@ def _jwt_expiry(access_token: str) -> datetime | None:
         exp = data.get("exp")
         if exp is None:
             return None
-        return datetime.fromtimestamp(float(exp))
+        return datetime.fromtimestamp(float(exp), tz=ZoneInfo("UTC"))
     except Exception:
         return None
 
@@ -760,7 +766,7 @@ def token_minutes_remaining(access_token: str) -> float | None:
     expiry = _jwt_expiry(access_token)
     if expiry is None:
         return None
-    return (expiry - datetime.now()).total_seconds() / 60.0
+    return (expiry - datetime.now(ZoneInfo("UTC"))).total_seconds() / 60.0
 
 
 def renew_dhan_token(client_id: str, access_token: str) -> ApiResult:
@@ -789,7 +795,7 @@ def renew_dhan_token(client_id: str, access_token: str) -> ApiResult:
                 return ApiResult(True, body, "Token renewed", response.status_code, elapsed)
         message = body.get("errorMessage") if isinstance(body, dict) else str(body)
         if isinstance(body, dict) and not message:
-            message = body.get("message") or body.get("remarks") or body.get("errorCode") or str(body)
+            message = body.get("message") or body.get("remarks") or body.get("errorCode") or body.get("errorType") or str(body)
         return ApiResult(False, body, str(message)[:300], response.status_code, elapsed)
     except requests.Timeout:
         return ApiResult(False, message="Dhan token renewal timed out.")
@@ -834,7 +840,7 @@ def generate_dhan_token_totp(client_id: str, pin: str, totp_secret: str) -> ApiR
             return ApiResult(True, body, "Fresh token generated", response.status_code, elapsed)
         message = body.get("errorMessage") if isinstance(body, dict) else str(body)
         if isinstance(body, dict) and not message:
-            message = body.get("message") or body.get("remarks") or body.get("errorCode") or str(body)
+            message = body.get("message") or body.get("remarks") or body.get("errorCode") or body.get("errorType") or str(body)
         return ApiResult(False, body, str(message)[:300], response.status_code, elapsed)
     except requests.Timeout:
         return ApiResult(False, message="Dhan token generation timed out.")
@@ -904,9 +910,13 @@ def api_call(
         return ApiResult(False, message=f"Network error: {exc}")
 
 
-@st.cache_data(ttl=15, show_spinner=False)
 def validate_connection(client_id: str, access_token: str) -> ApiResult:
-    return api_call("GET", "/positions", client_id, access_token)
+    """Use Dhan's Profile endpoint as the canonical lightweight token-validity check.
+
+    This function is intentionally NOT cached: after a token is renewed/generated we
+    must validate the exact token immediately rather than reuse a stale auth result.
+    """
+    return api_call("GET", "/profile", client_id, access_token)
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -2064,7 +2074,9 @@ config = load_config()
 # Persistent state fixes the V4 problem where clicking Validate connected
 # successfully but the next Streamlit rerun returned to FAST START/OFFLINE.
 if "live_enabled" not in st.session_state:
-    st.session_state.live_enabled = False
+    # Auto-connect on first load so the same public URL works on laptop/mobile
+    # without a separate Connect Live click when valid credentials are available.
+    st.session_state.live_enabled = True
 if "last_validation_message" not in st.session_state:
     st.session_state.last_validation_message = ""
 if "market_selector" not in st.session_state:
@@ -2073,6 +2085,10 @@ if "runtime_access_token" not in st.session_state:
     st.session_state.runtime_access_token = ""
 if "token_manager_message" not in st.session_state:
     st.session_state.token_manager_message = ""
+if "token_action_log" not in st.session_state:
+    st.session_state.token_action_log = {"ok": False, "status_code": None, "elapsed_ms": None, "message": "Not attempted"}
+if "last_totp_generation_epoch" not in st.session_state:
+    st.session_state.last_totp_generation_epoch = 0.0
 
 def select_market_from_button(name: str) -> None:
     """Synchronize the top index buttons with the sidebar selector."""
@@ -2096,15 +2112,25 @@ with st.sidebar:
         value=read_secret("DHAN_CLIENT_ID", str(config.get("client_id", ""))),
         placeholder="Example: 1100xxxxxx",
     )
-    saved_token = read_secret("DHAN_ACCESS_TOKEN", str(config.get("access_token", "")))
-    if st.session_state.runtime_access_token:
-        saved_token = st.session_state.runtime_access_token
-    access_token = st.text_area(
+    # IMPORTANT: a freshly generated token saved in the app's runtime config must
+    # take precedence over the original Streamlit Secret. Secrets are read-only and
+    # therefore become stale after the first successful renewal/generation.
+    config_token = str(config.get("access_token", "") or "").strip()
+    secret_token = read_secret("DHAN_ACCESS_TOKEN", "").strip()
+    seed_token = config_token or secret_token
+    if "dhan_access_token_input" not in st.session_state:
+        st.session_state.dhan_access_token_input = seed_token
+
+    access_token_input = st.text_area(
         "Dhan Access Token",
-        value=saved_token,
         height=120,
-        placeholder="Paste current token once; V11.2 can renew it before expiry",
+        placeholder="Paste a current token once; TOTP can regenerate it automatically",
+        key="dhan_access_token_input",
     )
+    # Never let an old text-area widget value overwrite a token generated during
+    # this Streamlit session. This was the main cause of 'Invalid Token' after a
+    # successful Renew / Generate action in V11.5.
+    access_token = (st.session_state.runtime_access_token or access_token_input or seed_token).strip()
 
     st.subheader("♻️ Auto Token Manager")
     auto_token_manager = st.toggle(
@@ -2256,50 +2282,112 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------
-# AUTO TOKEN MANAGER (V11.2)
+# AUTO TOKEN MANAGER (V11.6 hardened)
 # ---------------------------------------------------------------------
-# Renew an active Web-generated token before expiry. If that cannot be done
-# (for example, token already expired), optional TOTP credentials can generate
-# a fresh 24-hour token. The new token is kept in session and local config.
-# Streamlit Secrets are read-only, so TOTP fallback is recommended for cloud
-# restarts if fully unattended operation is desired.
-if client_id.strip() and access_token.strip():
-    current_remaining = token_minutes_remaining(access_token)
-else:
-    current_remaining = None
+# Design goals:
+# 1) The current runtime/config token wins over the original read-only Secret.
+# 2) Renew an active Web token before expiry.
+# 3) If renewal fails or token is missing/invalid, generate via PIN + TOTP.
+# 4) Respect Dhan's documented ~2-minute access-token generation guard.
+# 5) Save the new token in the app runtime config so laptop/mobile sessions on the
+#    same Streamlit instance can converge on one token instead of invalidating each other.
 
+def _remember_token_action(result: ApiResult, prefix: str = "") -> None:
+    st.session_state.token_action_log = {
+        "ok": bool(result.ok),
+        "status_code": result.status_code,
+        "elapsed_ms": result.elapsed_ms,
+        "message": f"{prefix}{result.message}".strip(),
+    }
+
+
+def _activate_new_token(new_token: str, result: ApiResult, source: str) -> None:
+    global access_token, config
+    access_token = new_token.strip()
+    st.session_state.runtime_access_token = access_token
+    config["client_id"] = client_id.strip()
+    config["access_token"] = access_token
+    save_config(config)
+    st.session_state.live_enabled = True
+    st.session_state.token_manager_message = f"✅ {source}: fresh Dhan token is active."
+    _remember_token_action(result, f"{source}: ")
+    st.cache_data.clear()
+
+
+def _can_generate_totp() -> tuple[bool, int]:
+    elapsed = time_module.time() - float(st.session_state.last_totp_generation_epoch or 0.0)
+    wait = max(0, int(TOTP_GENERATE_COOLDOWN_SECONDS - elapsed))
+    return wait <= 0, wait
+
+
+def _generate_with_totp(reason: str) -> ApiResult:
+    if not (client_id.strip() and dhan_pin.strip() and dhan_totp_secret.strip()):
+        return ApiResult(False, message="PIN + TOTP secret are required for fresh-token generation.")
+    allowed, wait = _can_generate_totp()
+    if not allowed:
+        return ApiResult(False, message=f"TOTP token generation cooldown active; retry in ~{wait}s.")
+    # Record the attempt time before the request to prevent rerun loops from sending
+    # duplicate generation calls if the network is slow or Dhan rejects the request.
+    st.session_state.last_totp_generation_epoch = time_module.time()
+    result = generate_dhan_token_totp(client_id.strip(), dhan_pin.strip(), dhan_totp_secret.strip())
+    _remember_token_action(result, f"TOTP ({reason}): ")
+    return result
+
+
+def _try_shared_config_token(current_token: str) -> tuple[str, ApiResult | None]:
+    """Before generating again, reuse a token another browser session just saved."""
+    latest = load_config()
+    candidate = str(latest.get("access_token", "") or "").strip()
+    if candidate and candidate != current_token.strip():
+        test = validate_connection(client_id.strip(), candidate)
+        if test.ok:
+            st.session_state.runtime_access_token = candidate
+            return candidate, test
+    return current_token, None
+
+
+current_remaining = token_minutes_remaining(access_token) if access_token else None
 need_auto_token_action = bool(
     auto_token_manager
     and client_id.strip()
-    and access_token.strip()
-    and current_remaining is not None
-    and current_remaining <= float(renew_before_minutes)
+    and (
+        not access_token
+        or (current_remaining is not None and current_remaining <= float(renew_before_minutes))
+    )
 )
 
 if manual_renew_clicked or need_auto_token_action:
     token_action = ApiResult(False, message="Not attempted")
-    # First choice: official RenewToken while current token is still active.
-    if access_token.strip() and (current_remaining is None or current_remaining > 0):
-        token_action = renew_dhan_token(client_id.strip(), access_token.strip())
 
-    # Fallback: official TOTP generation endpoint for expired/failed renewal.
-    if (not token_action.ok) and dhan_pin.strip() and dhan_totp_secret.strip():
-        token_action = generate_dhan_token_totp(
-            client_id.strip(), dhan_pin.strip(), dhan_totp_secret.strip()
-        )
-
-    new_token = extract_access_token(token_action)
-    if new_token:
-        access_token = new_token
-        st.session_state.runtime_access_token = new_token
-        config["client_id"] = client_id.strip()
-        config["access_token"] = new_token
-        save_config(config)
+    # If another browser already refreshed the shared runtime config, prefer it and
+    # avoid generating yet another token.
+    access_token, shared_test = _try_shared_config_token(access_token)
+    if shared_test is not None:
+        token_action = shared_test
         st.session_state.live_enabled = True
-        st.session_state.token_manager_message = "✅ New Dhan token active for the next validity window."
-        st.cache_data.clear()
+        st.session_state.token_manager_message = "✅ Reused fresh token from shared app runtime."
+        _remember_token_action(shared_test, "Shared runtime token: ")
     else:
-        st.session_state.token_manager_message = f"⚠️ Auto Token Manager: {token_action.message}"
+        # First choice: official RenewToken while the current token appears active.
+        if access_token and (current_remaining is None or current_remaining > 0):
+            token_action = renew_dhan_token(client_id.strip(), access_token)
+            _remember_token_action(token_action, "RenewToken: ")
+
+        # Fallback: official TOTP generation endpoint. This also handles expired,
+        # missing, mismatched, or otherwise invalid tokens.
+        if not token_action.ok:
+            totp_result = _generate_with_totp("manual/auto fallback")
+            if totp_result.ok:
+                token_action = totp_result
+            elif token_action.message == "Not attempted":
+                token_action = totp_result
+
+        new_token = extract_access_token(token_action)
+        if new_token:
+            source = "TOTP Generate" if "accessToken" in (token_action.data or {}) and not (access_token and token_action.message == "Token renewed") else "Token Refresh"
+            _activate_new_token(new_token, token_action, source)
+        elif not token_action.ok:
+            st.session_state.token_manager_message = f"⚠️ Auto Token Manager: {token_action.message}"
 
 if st.session_state.token_manager_message:
     st.sidebar.caption(st.session_state.token_manager_message)
@@ -2309,7 +2397,7 @@ if st.session_state.token_manager_message:
 # ---------------------------------------------------------------------
 credentials_present = bool(client_id.strip() and access_token.strip())
 should_check_connection = credentials_present and (
-    validate_clicked or refresh_clicked or st.session_state.live_enabled
+    validate_clicked or refresh_clicked or manual_renew_clicked or st.session_state.live_enabled
 )
 connection = (
     validate_connection(client_id.strip(), access_token.strip())
@@ -2317,7 +2405,30 @@ connection = (
     else ApiResult(False, message="Not checked")
 )
 
-if validate_clicked:
+# Self-heal stale/invalid tokens. First see whether another Streamlit browser
+# session has already saved a newer token. Only then spend a TOTP generation call.
+if (
+    should_check_connection
+    and not connection.ok
+    and auto_token_manager
+    and classify_api_error(connection) in ("AUTH_ERROR", "TOKEN_EXPIRED")
+):
+    access_token, shared_test = _try_shared_config_token(access_token)
+    if shared_test is not None:
+        connection = shared_test
+        credentials_present = True
+        st.session_state.live_enabled = True
+        st.session_state.token_manager_message = "✅ Switched to newer shared runtime token."
+        _remember_token_action(shared_test, "Shared-token recovery: ")
+    elif dhan_pin.strip() and dhan_totp_secret.strip():
+        recovery = _generate_with_totp("invalid-token recovery")
+        recovery_token = extract_access_token(recovery)
+        if recovery_token:
+            _activate_new_token(recovery_token, recovery, "TOTP Recovery")
+            connection = validate_connection(client_id.strip(), access_token.strip())
+            credentials_present = bool(access_token)
+
+if validate_clicked or manual_renew_clicked:
     if connection.ok:
         st.session_state.live_enabled = True
         st.session_state.last_validation_message = (
@@ -2856,7 +2967,8 @@ with risk_tab:
 with log_tab:
     logs = pd.DataFrame(
         [
-            ["Connection", connection.ok, connection.status_code, connection.elapsed_ms, connection.message],
+            ["Token Manager", st.session_state.token_action_log.get("ok", False), st.session_state.token_action_log.get("status_code"), st.session_state.token_action_log.get("elapsed_ms"), st.session_state.token_action_log.get("message", "Not attempted")],
+            ["Connection / Profile", connection.ok, connection.status_code, connection.elapsed_ms, connection.message],
             ["Expiry List", expiry_result.ok, expiry_result.status_code, expiry_result.elapsed_ms, expiry_result.message],
             ["Option Chain", chain_result.ok, chain_result.status_code, chain_result.elapsed_ms, chain_result.message],
             ["5m Candles", result5.ok, result5.status_code, result5.elapsed_ms, result5.message],
@@ -2874,6 +2986,6 @@ with log_tab:
 
 st.markdown("---")
 st.caption(
-    "V11.5 Research Fusion Pro is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
+    "V11.6 Research Fusion Pro is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
     "Verify the instrument ID, expiry, liquidity, bid–ask spread, charges, and risk before any trade."
 )
