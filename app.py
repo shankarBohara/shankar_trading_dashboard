@@ -20,6 +20,10 @@ from __future__ import annotations
 import json
 import math
 import time as time_module
+import base64
+import hashlib
+import hmac
+import struct
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -40,8 +44,10 @@ except Exception:
 # APP CONFIG
 # ---------------------------------------------------------------------
 APP_NAME = "Shankar Trading Dashboard"
-APP_VERSION = "V10.3 Pro Terminal"
+APP_VERSION = "V11.3 Research Fusion Pro"
 DHAN_BASE = "https://api.dhan.co/v2"
+DHAN_AUTH_BASE = "https://auth.dhan.co/app"
+AUTO_RENEW_BEFORE_MINUTES = 60
 CONFIG_PATH = Path(__file__).with_name(".shankar_dashboard_config.json")
 REQUEST_TIMEOUT = 10
 DHAN_INSTRUMENT_MASTER = "https://images.dhan.co/api-data/api-scrip-master.csv"
@@ -69,7 +75,7 @@ st.set_page_config(
     page_title=APP_NAME,
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ---------------------------------------------------------------------
@@ -78,12 +84,6 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* V10.3 popup-clean: keep Market Setup logic alive but hide the Streamlit sidebar UI.
-   Dhan credentials are entered only from the lock popover in the main dashboard. */
-[data-testid="stSidebar"] {display:none !important;}
-[data-testid="collapsedControl"] {display:none !important;}
-button[kind="header"] {display:none !important;}
-
 :root {
     --bg-1:#041124;
     --bg-2:#071d3d;
@@ -484,7 +484,7 @@ div[data-baseweb="select"] > div,
     .index-strip{grid-template-columns:repeat(2,minmax(0,1fr));}
 }
 
-/* V10.3 terminal-style additions */
+/* V11 terminal-style additions */
 [data-testid="stAppViewContainer"] .block-container {max-width:1900px;padding-left:.7rem!important;padding-right:.7rem!important;}
 .pro-summary {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:8px 0 12px;}
 .pro-card {background:linear-gradient(145deg,#071827,#0a2236);border:1px solid #173b55;border-radius:12px;padding:13px;min-height:108px;box-shadow:0 10px 28px rgba(0,0,0,.28);}
@@ -723,6 +723,116 @@ def load_config() -> dict[str, Any]:
 
 def save_config(config: dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+
+
+def _jwt_expiry(access_token: str) -> datetime | None:
+    """Read JWT exp without verifying the signature; used only for local expiry timing."""
+    try:
+        parts = access_token.strip().split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+        exp = data.get("exp")
+        if exp is None:
+            return None
+        return datetime.fromtimestamp(float(exp))
+    except Exception:
+        return None
+
+
+def token_minutes_remaining(access_token: str) -> float | None:
+    expiry = _jwt_expiry(access_token)
+    if expiry is None:
+        return None
+    return (expiry - datetime.now()).total_seconds() / 60.0
+
+
+def renew_dhan_token(client_id: str, access_token: str) -> ApiResult:
+    """Renew an ACTIVE Dhan Web-generated token for another 24 hours."""
+    if not client_id.strip() or not access_token.strip():
+        return ApiResult(False, message="Client ID and Access Token are required for renewal.")
+    started = time_module.perf_counter()
+    try:
+        response = requests.get(
+            f"{DHAN_BASE}/RenewToken",
+            headers={
+                "Accept": "application/json",
+                "access-token": access_token.strip(),
+                "dhanClientId": client_id.strip(),
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        elapsed = round((time_module.perf_counter() - started) * 1000)
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text
+        if response.ok and isinstance(body, dict):
+            new_token = body.get("accessToken") or body.get("access_token") or body.get("token")
+            if new_token:
+                return ApiResult(True, body, "Token renewed", response.status_code, elapsed)
+        message = body.get("errorMessage") if isinstance(body, dict) else str(body)
+        if isinstance(body, dict) and not message:
+            message = body.get("message") or body.get("remarks") or body.get("errorCode") or str(body)
+        return ApiResult(False, body, str(message)[:300], response.status_code, elapsed)
+    except requests.Timeout:
+        return ApiResult(False, message="Dhan token renewal timed out.")
+    except requests.RequestException as exc:
+        return ApiResult(False, message=f"Token renewal network error: {exc}")
+
+
+def _totp_code(secret: str, digits: int = 6, period: int = 30) -> str:
+    """RFC 6238 TOTP using stdlib only; avoids an extra pyotp dependency."""
+    clean = "".join(secret.strip().replace(" ", "").split()).upper()
+    padding = "=" * (-len(clean) % 8)
+    key = base64.b32decode(clean + padding, casefold=True)
+    counter = int(time_module.time() // period)
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = (struct.unpack(">I", digest[offset:offset+4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def generate_dhan_token_totp(client_id: str, pin: str, totp_secret: str) -> ApiResult:
+    """Generate a fresh 24-hour Dhan token when TOTP is enabled on the account."""
+    if not client_id.strip() or not pin.strip() or not totp_secret.strip():
+        return ApiResult(False, message="Client ID, Dhan PIN and TOTP secret are required.")
+    try:
+        totp = _totp_code(totp_secret)
+    except Exception as exc:
+        return ApiResult(False, message=f"Invalid TOTP secret: {exc}")
+    started = time_module.perf_counter()
+    try:
+        response = requests.post(
+            f"{DHAN_AUTH_BASE}/generateAccessToken",
+            params={"dhanClientId": client_id.strip(), "pin": pin.strip(), "totp": totp},
+            timeout=REQUEST_TIMEOUT,
+        )
+        elapsed = round((time_module.perf_counter() - started) * 1000)
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text
+        if response.ok and isinstance(body, dict) and body.get("accessToken"):
+            return ApiResult(True, body, "Fresh token generated", response.status_code, elapsed)
+        message = body.get("errorMessage") if isinstance(body, dict) else str(body)
+        if isinstance(body, dict) and not message:
+            message = body.get("message") or body.get("remarks") or body.get("errorCode") or str(body)
+        return ApiResult(False, body, str(message)[:300], response.status_code, elapsed)
+    except requests.Timeout:
+        return ApiResult(False, message="Dhan token generation timed out.")
+    except requests.RequestException as exc:
+        return ApiResult(False, message=f"Token generation network error: {exc}")
+
+
+def extract_access_token(result: ApiResult) -> str:
+    if not result.ok or not isinstance(result.data, dict):
+        return ""
+    return str(result.data.get("accessToken") or result.data.get("access_token") or result.data.get("token") or "").strip()
 
 
 def make_headers(client_id: str, access_token: str) -> dict[str, str]:
@@ -1107,7 +1217,7 @@ def extract_option_side(side: Any) -> dict[str, float]:
         "ltp": safe_float(side.get("last_price", side.get("ltp"))),
         "change": safe_float(side.get("net_change", side.get("change"))),
         "oi": safe_float(side.get("oi")),
-        "oi_change": safe_float(side.get("oi_change", side.get("change_oi"))),
+        "oi_change": safe_float(side.get("oi_change", side.get("change_oi", safe_float(side.get("oi"), 0) - safe_float(side.get("previous_oi"), 0)))),
         "volume": safe_float(side.get("volume")),
         "iv": safe_float(side.get("implied_volatility", side.get("iv"))),
         "bid": safe_float(side.get("top_bid_price", side.get("bid"))),
@@ -1296,6 +1406,39 @@ def final_decision(
 
 
 
+
+
+def research_fusion_decision(sig5: dict[str, Any], sig15: dict[str, Any], metrics: dict[str, Any], flow: dict[str, Any], india_vix: float = np.nan) -> dict[str, Any]:
+    """V11.3: confirmation-first fusion. 5m executes; 15m confirms; option flow can confirm/veto.
+    Designed to reduce false positives, not to predict or guarantee returns.
+    """
+    base = final_decision(sig5, sig15, metrics)
+    if not sig5.get("available") or not sig15.get("available"):
+        return base
+    aligned = sig5.get("trend") == sig15.get("trend") and sig5.get("trend") in ("Bullish", "Bearish")
+    if not aligned:
+        base.update({"action":"WAIT — TIMEFRAMES NOT ALIGNED", "confidence":min(int(base.get("confidence",0)),79), "css":"", "reason":"V11.3 requires 5m execution and 15m trend alignment before a setup."})
+        return base
+    bullish = sig5["trend"] == "Bullish"
+    tech = sig5["score"] * 0.50 + sig15["score"] * 0.35
+    option_component = (flow.get("flow_score",50) if bullish else 100-flow.get("flow_score",50)) * 0.15
+    confidence = int(max(0,min(100,round(tech + option_component))))
+    # Hard conflict veto. Option-chain evidence is confirmation, never a stand-alone trigger.
+    conflict = (bullish and flow.get("flow_score",50) <= 42) or ((not bullish) and flow.get("flow_score",50) >= 58)
+    # Avoid chasing extremely stretched RSI; keep it a wait condition rather than reverse signal.
+    rsi5 = safe_float(sig5.get("rsi"), np.nan)
+    stretched = math.isfinite(rsi5) and ((bullish and rsi5 >= 76) or ((not bullish) and rsi5 <= 24))
+    if conflict:
+        action = "WAIT — OPTION FLOW CONFLICT"; css=""; reason="Trend aligns, but live option flow conflicts with the direction."
+    elif stretched:
+        action = "WAIT — RSI STRETCHED"; css=""; reason="Trend aligns, but 5m RSI is stretched; wait for a cleaner entry/retest."
+    elif confidence >= 80:
+        action = "BUY CE SETUP" if bullish else "BUY PE SETUP"; css="buy" if bullish else "sell"; reason="V11.3 research-fusion confirmation passed: 5m + 15m alignment with supportive option flow."
+    elif confidence >= 70:
+        action = "WAIT FOR BULLISH CONFIRMATION" if bullish else "WAIT FOR BEARISH CONFIRMATION"; css=""; reason="Directional alignment exists, but fused confidence is below the 80% entry rule."
+    else:
+        action="NO TRADE"; css=""; reason="V11.3 fused evidence is below the minimum quality threshold."
+    return {"action":action,"confidence":confidence,"bias":"Bullish" if bullish else "Bearish","css":css,"reason":reason}
 
 def option_flow_intelligence(df: pd.DataFrame, spot: float | None, metrics: dict[str, Any]) -> dict[str, Any]:
     """Compact option-flow readout using OI, OI change, volume, IV and ATM straddle."""
@@ -1582,7 +1725,7 @@ def build_trade_plan(
     side = "CE" if action.startswith("BUY CE") else "PE"
     contract = select_best_option_contract(chain, side, metrics)
     if not contract.get("ok"):
-        plan["note"] = "V10.3 blocked contract: " + str(contract.get("reason", "weak liquidity/quality"))
+        plan["note"] = "V11.3 blocked contract: " + str(contract.get("reason", "weak liquidity/quality"))
         return plan
     entry = safe_float(contract.get("entry"), np.nan)
     if not math.isfinite(entry) or entry <= 0:
@@ -1606,7 +1749,7 @@ def build_trade_plan(
             "t2": entry + 2 * risk,
             "t3": entry + 3 * risk,
             "rr": "1:3",
-            "note": "V10.3 selected liquid near-ATM contract • " + str(contract.get("reason", "")) + ". Confirm 5m candle close before entry.",
+            "note": "V11.1 selected liquid near-ATM contract • " + str(contract.get("reason", "")) + ". Confirm 5m candle close before entry.",
         }
     )
     return plan
@@ -1652,24 +1795,90 @@ def option_chain_styler(
             styles.append(base)
         return styles
 
-    return display.style.apply(style_row, axis=1).format(precision=2, na_rep="—")
+    def compact(v: Any) -> str:
+        x = safe_float(v, np.nan)
+        if not math.isfinite(x):
+            return "—"
+        ax = abs(x)
+        if ax >= 10_000_000:
+            return f"{x/10_000_000:.2f}Cr"
+        if ax >= 100_000:
+            return f"{x/100_000:.2f}L"
+        if ax >= 1_000:
+            return f"{x/1_000:.1f}K"
+        return f"{x:.2f}"
+
+    fmt = {}
+    for col in display.columns:
+        if col in {"CE OI", "CE Chg OI", "CE Vol", "PE Vol", "PE Chg OI", "PE OI"}:
+            fmt[col] = compact
+        elif col == "STRIKE":
+            fmt[col] = lambda v: f"{safe_float(v, 0):.0f}"
+        else:
+            fmt[col] = lambda v: "—" if not math.isfinite(safe_float(v, np.nan)) else f"{safe_float(v):.2f}"
+    return display.style.apply(style_row, axis=1).format(fmt, na_rep="—")
 
 
-def option_oi_levels(df: pd.DataFrame) -> dict[str, float]:
-    """Return top two PE-OI supports and CE-OI resistances for terminal display."""
+def option_oi_levels(df: pd.DataFrame, spot: float | None = None) -> dict[str, float]:
+    """V11.1 dynamic OI walls: nearest meaningful PE support / CE resistance around live spot.
+
+    Uses live OI plus positive intraday OI build-up. Levels are deliberately restricted
+    to the active strike neighbourhood so a huge but distant OI wall does not freeze
+    Support/Resistance for several sessions.
+    """
     result = {"support1": np.nan, "support2": np.nan, "resistance1": np.nan, "resistance2": np.nan}
     if df.empty:
         return result
     work = df.copy()
-    work["CE_OI"] = pd.to_numeric(work.get("CE_OI", 0), errors="coerce").fillna(0)
-    work["PE_OI"] = pd.to_numeric(work.get("PE_OI", 0), errors="coerce").fillna(0)
-    pe = work.nlargest(2, "PE_OI")
-    ce = work.nlargest(2, "CE_OI")
-    if len(pe) > 0: result["support1"] = safe_float(pe.iloc[0]["Strike"], np.nan)
-    if len(pe) > 1: result["support2"] = safe_float(pe.iloc[1]["Strike"], np.nan)
-    if len(ce) > 0: result["resistance1"] = safe_float(ce.iloc[0]["Strike"], np.nan)
-    if len(ce) > 1: result["resistance2"] = safe_float(ce.iloc[1]["Strike"], np.nan)
+    work["Strike"] = pd.to_numeric(work.get("Strike"), errors="coerce")
+    for col in ("CE_OI", "PE_OI", "CE_OI_CHANGE", "PE_OI_CHANGE", "CE_VOLUME", "PE_VOLUME"):
+        work[col] = pd.to_numeric(work.get(col, 0), errors="coerce").fillna(0)
+    work = work.dropna(subset=["Strike"])
+    if work.empty:
+        return result
+
+    live_spot = safe_float(spot, np.nan)
+    if not math.isfinite(live_spot):
+        live_spot = safe_float(work["Strike"].median(), np.nan)
+
+    strikes = sorted(work["Strike"].unique())
+    step = float(np.nanmedian(np.diff(strikes))) if len(strikes) > 1 else max(live_spot * 0.002, 1)
+    # Active neighbourhood: at least 8 strikes each side, roughly <=4% of spot.
+    radius = max(step * 8, live_spot * 0.025)
+    radius = min(radius, live_spot * 0.04)
+    near = work[(work["Strike"] >= live_spot - radius) & (work["Strike"] <= live_spot + radius)].copy()
+    if near.empty:
+        near = work.copy()
+
+    # Positive fresh OI build-up gets extra weight; volume breaks ties and keeps levels responsive.
+    near["PE_WALL"] = near["PE_OI"] + near["PE_OI_CHANGE"].clip(lower=0) * 1.75 + np.sqrt(near["PE_VOLUME"].clip(lower=0))
+    near["CE_WALL"] = near["CE_OI"] + near["CE_OI_CHANGE"].clip(lower=0) * 1.75 + np.sqrt(near["CE_VOLUME"].clip(lower=0))
+
+    supports = near[near["Strike"] <= live_spot].nlargest(2, "PE_WALL")
+    resistances = near[near["Strike"] >= live_spot].nlargest(2, "CE_WALL")
+    if len(supports) > 0: result["support1"] = safe_float(supports.iloc[0]["Strike"], np.nan)
+    if len(supports) > 1: result["support2"] = safe_float(supports.iloc[1]["Strike"], np.nan)
+    if len(resistances) > 0: result["resistance1"] = safe_float(resistances.iloc[0]["Strike"], np.nan)
+    if len(resistances) > 1: result["resistance2"] = safe_float(resistances.iloc[1]["Strike"], np.nan)
     return result
+
+
+def price_structure_levels(df5: pd.DataFrame, df15: pd.DataFrame, spot: float | None) -> dict[str, float]:
+    """Dynamic price-action S/R from recent completed 5m/15m structure."""
+    out = {"support": np.nan, "resistance": np.nan}
+    frames=[]
+    if not df5.empty: frames.append(df5.tail(48))
+    if not df15.empty: frames.append(df15.tail(24))
+    if not frames: return out
+    x=pd.concat(frames, ignore_index=True)
+    px=safe_float(spot, safe_float(x.iloc[-1].get("close"), np.nan))
+    lows=pd.to_numeric(x.get("low"), errors="coerce").dropna()
+    highs=pd.to_numeric(x.get("high"), errors="coerce").dropna()
+    below=lows[lows < px]
+    above=highs[highs > px]
+    if not below.empty: out["support"] = float(below.tail(20).max())
+    if not above.empty: out["resistance"] = float(above.tail(20).min())
+    return out
 
 def chart_figure(df: pd.DataFrame, title: str) -> go.Figure:
     fig = go.Figure()
@@ -1758,6 +1967,10 @@ if "last_validation_message" not in st.session_state:
     st.session_state.last_validation_message = ""
 if "market_selector" not in st.session_state:
     st.session_state.market_selector = "NIFTY 50"
+if "runtime_access_token" not in st.session_state:
+    st.session_state.runtime_access_token = ""
+if "token_manager_message" not in st.session_state:
+    st.session_state.token_manager_message = ""
 
 def select_market_from_button(name: str) -> None:
     """Synchronize the top index buttons with the sidebar selector."""
@@ -1773,65 +1986,97 @@ for extra_name in ("SENSEX", "BANKEX"):
     if extra_name in discovered_indices:
         AVAILABLE_MARKETS[extra_name] = discovered_indices[extra_name]
 
-# Compact Dhan login popup for desktop + mobile.
-# Credentials are intentionally kept out of the main dashboard until the lock icon is opened.
-client_id = read_secret("DHAN_CLIENT_ID", str(config.get("client_id", "")))
-access_token = read_secret("DHAN_ACCESS_TOKEN", str(config.get("access_token", "")))
-validate_clicked = False
-
-login_col, _login_spacer = st.columns([0.7, 11.3])
-with login_col:
-    with st.popover("🔐", help="Open Dhan Client ID / Access Token"):
-        st.markdown("### Dhan Connection")
-        client_id = st.text_input(
-            "Dhan Client ID",
-            value=client_id,
-            placeholder="Example: 1100xxxxxx",
-            key="popup_dhan_client_id",
-        )
-        access_token = st.text_area(
-            "Dhan Access Token",
-            value=access_token,
-            height=150,
-            placeholder="Paste the current Dhan access token",
-            key="popup_dhan_access_token",
-        )
-        p1, p2 = st.columns(2)
-        with p1:
-            save_clicked = st.button("💾 Save", use_container_width=True, key="popup_save_dhan")
-        with p2:
-            validate_clicked = st.button("✅ Connect", use_container_width=True, key="popup_connect_dhan")
-
-        if save_clicked:
-            if client_id.strip() and access_token.strip():
-                config["client_id"] = client_id.strip()
-                config["access_token"] = access_token.strip()
-                save_config(config)
-                st.success("Credentials saved.")
-            else:
-                st.warning("Enter Client ID and Access Token.")
-
-        if validate_clicked:
-            if client_id.strip() and access_token.strip():
-                config["client_id"] = client_id.strip()
-                config["access_token"] = access_token.strip()
-                save_config(config)
-                st.session_state.live_enabled = True
-                st.cache_data.clear()
-            else:
-                st.session_state.live_enabled = False
-                st.warning("Enter Client ID and Access Token.")
-
-        if st.button("🗑 Clear Token", use_container_width=True, key="popup_clear_dhan"):
-            config["client_id"] = ""
-            config["access_token"] = ""
-            save_config(config)
-            st.session_state.live_enabled = False
-            st.cache_data.clear()
-            st.success("Token cleared.")
-
 with st.sidebar:
-    st.header("⚙️ Market Setup")
+    st.header("🔐 Dhan Connection")
+
+    client_id = st.text_input(
+        "Dhan Client ID",
+        value=read_secret("DHAN_CLIENT_ID", str(config.get("client_id", ""))),
+        placeholder="Example: 1100xxxxxx",
+    )
+    saved_token = read_secret("DHAN_ACCESS_TOKEN", str(config.get("access_token", "")))
+    if st.session_state.runtime_access_token:
+        saved_token = st.session_state.runtime_access_token
+    access_token = st.text_area(
+        "Dhan Access Token",
+        value=saved_token,
+        height=120,
+        placeholder="Paste current token once; V11.2 can renew it before expiry",
+    )
+
+    st.subheader("♻️ Auto Token Manager")
+    auto_token_manager = st.toggle(
+        "Auto renew/generate token",
+        value=True,
+        help="Renews an active Web token before expiry. Optional TOTP fallback can generate a fresh 24-hour token.",
+    )
+    renew_before_minutes = st.select_slider(
+        "Renew before expiry",
+        options=[15, 30, 45, 60, 90, 120],
+        value=AUTO_RENEW_BEFORE_MINUTES,
+        format_func=lambda x: f"{x} min",
+    )
+    dhan_pin = st.text_input(
+        "Dhan PIN (optional TOTP fallback)",
+        value=read_secret("DHAN_PIN", ""),
+        type="password",
+        help="Do not put this in public source code. Prefer Streamlit Secrets.",
+    )
+    dhan_totp_secret = st.text_input(
+        "TOTP Secret (optional fallback)",
+        value=read_secret("DHAN_TOTP_SECRET", ""),
+        type="password",
+        help="Authenticator setup secret, not the changing 6-digit TOTP code. Prefer Streamlit Secrets.",
+    )
+    mins_left = token_minutes_remaining(access_token) if access_token.strip() else None
+    if mins_left is not None:
+        if mins_left > 0:
+            st.caption(f"Token time remaining: ~{mins_left/60:.1f} hours")
+        else:
+            st.caption("Token appears expired.")
+    elif access_token.strip():
+        st.caption("Token expiry could not be read; connection validation will decide status.")
+
+    manual_renew_clicked = st.button("♻️ Renew / Generate Now", use_container_width=True)
+
+    s1, s2 = st.columns(2)
+    with s1:
+        save_clicked = st.button("💾 Save", use_container_width=True)
+    with s2:
+        validate_clicked = st.button("✅ Connect Live", use_container_width=True)
+
+    if save_clicked:
+        if client_id.strip() and access_token.strip():
+            config["client_id"] = client_id.strip()
+            config["access_token"] = access_token.strip()
+            save_config(config)
+            st.success("Credentials saved on this computer.")
+        else:
+            st.warning("Enter Client ID and Access Token.")
+
+    if validate_clicked:
+        if client_id.strip() and access_token.strip():
+            # Save first, then keep live mode enabled across all later reruns.
+            config["client_id"] = client_id.strip()
+            config["access_token"] = access_token.strip()
+            save_config(config)
+            st.session_state.live_enabled = True
+            st.cache_data.clear()
+        else:
+            st.session_state.live_enabled = False
+            st.warning("Enter Client ID and Access Token.")
+
+    if st.button("🗑 Clear Token", use_container_width=True):
+        config["client_id"] = ""
+        config["access_token"] = ""
+        save_config(config)
+        st.session_state.runtime_access_token = ""
+        st.session_state.live_enabled = False
+        st.cache_data.clear()
+        st.success("Token cleared. Refresh once.")
+
+    st.divider()
+    st.subheader("⚙️ Market Setup")
     if discovered_indices:
         st.caption(f"Official Dhan master: {len(discovered_indices)} index mappings resolved.")
     else:
@@ -1906,9 +2151,59 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Security: On Streamlit Cloud, use Secrets named DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN. "
-        "Local Save writes a hidden JSON beside this file; never upload that JSON to GitHub."
+        "Security: On Streamlit Cloud use Secrets: DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN. "
+        "For automatic fresh-token fallback, optionally add DHAN_PIN + DHAN_TOTP_SECRET. "
+        "Never upload PIN/TOTP secret or the hidden local JSON to GitHub."
     )
+
+# ---------------------------------------------------------------------
+# AUTO TOKEN MANAGER (V11.2)
+# ---------------------------------------------------------------------
+# Renew an active Web-generated token before expiry. If that cannot be done
+# (for example, token already expired), optional TOTP credentials can generate
+# a fresh 24-hour token. The new token is kept in session and local config.
+# Streamlit Secrets are read-only, so TOTP fallback is recommended for cloud
+# restarts if fully unattended operation is desired.
+if client_id.strip() and access_token.strip():
+    current_remaining = token_minutes_remaining(access_token)
+else:
+    current_remaining = None
+
+need_auto_token_action = bool(
+    auto_token_manager
+    and client_id.strip()
+    and access_token.strip()
+    and current_remaining is not None
+    and current_remaining <= float(renew_before_minutes)
+)
+
+if manual_renew_clicked or need_auto_token_action:
+    token_action = ApiResult(False, message="Not attempted")
+    # First choice: official RenewToken while current token is still active.
+    if access_token.strip() and (current_remaining is None or current_remaining > 0):
+        token_action = renew_dhan_token(client_id.strip(), access_token.strip())
+
+    # Fallback: official TOTP generation endpoint for expired/failed renewal.
+    if (not token_action.ok) and dhan_pin.strip() and dhan_totp_secret.strip():
+        token_action = generate_dhan_token_totp(
+            client_id.strip(), dhan_pin.strip(), dhan_totp_secret.strip()
+        )
+
+    new_token = extract_access_token(token_action)
+    if new_token:
+        access_token = new_token
+        st.session_state.runtime_access_token = new_token
+        config["client_id"] = client_id.strip()
+        config["access_token"] = new_token
+        save_config(config)
+        st.session_state.live_enabled = True
+        st.session_state.token_manager_message = "✅ New Dhan token active for the next validity window."
+        st.cache_data.clear()
+    else:
+        st.session_state.token_manager_message = f"⚠️ Auto Token Manager: {token_action.message}"
+
+if st.session_state.token_manager_message:
+    st.sidebar.caption(st.session_state.token_manager_message)
 
 # ---------------------------------------------------------------------
 # CONNECTION & FETCH
@@ -2093,13 +2388,9 @@ sig5 = timeframe_signal(df5)
 sig15 = timeframe_signal(df15)
 metrics = option_metrics(df_chain, spot)
 flow = option_flow_intelligence(df_chain, spot, metrics)
-oi_levels = option_oi_levels(df_chain)
-decision = final_decision(sig5, sig15, metrics)
-# V10.3 confirmation veto: strong opposite option-flow prevents a fresh BUY setup.
-if decision["action"].startswith("BUY CE") and flow["flow_score"] <= 38:
-    decision.update({"action": "WAIT — OPTION FLOW CONFLICT", "css": "", "reason": "Technical setup is bullish, but option-chain flow is strongly bearish."})
-elif decision["action"].startswith("BUY PE") and flow["flow_score"] >= 62:
-    decision.update({"action": "WAIT — OPTION FLOW CONFLICT", "css": "", "reason": "Technical setup is bearish, but option-chain flow is strongly bullish."})
+oi_levels = option_oi_levels(df_chain, spot)
+structure_levels = price_structure_levels(df5, df15, spot)
+decision = research_fusion_decision(sig5, sig15, metrics, flow, india_vix)
 pivots = calculate_pivots(df15 if not df15.empty else df5)
 liquidity = liquidity_filter(df_chain, metrics)
 backtest = simple_backtest(df5, df15)
@@ -2107,7 +2398,7 @@ trade_plan = build_trade_plan(decision, df_chain, metrics, sig5)
 
 if trade_plan["side"] != "WAIT" and not liquidity["ok"]:
     trade_plan["side"] = "WAIT"
-    trade_plan["note"] = liquidity["reason"] + ". Trade blocked by V10.3 liquidity/data-quality filter."
+    trade_plan["note"] = liquidity["reason"] + ". Trade blocked by V11.3 liquidity/data-quality filter."
 
 if not market_open and decision["action"].startswith("BUY"):
     decision["action"] = "MARKET CLOSED — LAST DATA ONLY"
@@ -2115,7 +2406,7 @@ if not market_open and decision["action"].startswith("BUY"):
     decision["reason"] = "Signals are historical snapshots. New live entry is disabled outside market hours."
 
 # ---------------------------------------------------------------------
-# V10.3 PRO TERMINAL SUMMARY — ONLY 5m EXECUTION + 15m TREND
+# V11.1 PRO TERMINAL SUMMARY — ONLY 5m EXECUTION + 15m TREND
 # ---------------------------------------------------------------------
 aligned = sig5["trend"] == sig15["trend"] and sig5["trend"] in ("Bullish", "Bearish")
 alignment_text = sig5["trend"] if aligned else "Mixed"
@@ -2138,13 +2429,22 @@ st.markdown(
 st.markdown(
     f"""
 <div class="level-strip2">
- <div class="level2 lv-s"><div class="k">SUPPORT 1</div><div class="v">{fmt_num(oi_levels['support1'],0)}</div></div>
- <div class="level2 lv-s"><div class="k">SUPPORT 2</div><div class="v">{fmt_num(oi_levels['support2'],0)}</div></div>
+ <div class="level2 lv-s"><div class="k">LIVE OI SUPPORT 1</div><div class="v">{fmt_num(oi_levels['support1'],0)}</div></div>
+ <div class="level2 lv-s"><div class="k">LIVE OI SUPPORT 2</div><div class="v">{fmt_num(oi_levels['support2'],0)}</div></div>
  <div class="level2 lv-p"><div class="k">PIVOT</div><div class="v">{fmt_num(pivots['P'],0)}</div></div>
- <div class="level2 lv-r"><div class="k">RESISTANCE 1</div><div class="v">{fmt_num(oi_levels['resistance1'],0)}</div></div>
- <div class="level2 lv-r"><div class="k">RESISTANCE 2</div><div class="v">{fmt_num(oi_levels['resistance2'],0)}</div></div>
+ <div class="level2 lv-r"><div class="k">LIVE OI RESISTANCE 1</div><div class="v">{fmt_num(oi_levels['resistance1'],0)}</div></div>
+ <div class="level2 lv-r"><div class="k">LIVE OI RESISTANCE 2</div><div class="v">{fmt_num(oi_levels['resistance2'],0)}</div></div>
  <div class="level2 lv-x"><div class="k">SPOT</div><div class="v">{fmt_num(spot,2)}</div></div>
  <div class="level2 lv-p"><div class="k">ATM</div><div class="v">{fmt_num(metrics['atm'],0)}</div></div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown(f"""
+<div class="level-strip2">
+ <div class="level2 lv-s"><div class="k">5m/15m DYNAMIC SUPPORT</div><div class="v">{fmt_num(structure_levels['support'],2)}</div></div>
+ <div class="level2 lv-r"><div class="k">5m/15m DYNAMIC RESISTANCE</div><div class="v">{fmt_num(structure_levels['resistance'],2)}</div></div>
+ <div class="level2 lv-p"><div class="k">PREVIOUS DAY HIGH</div><div class="v">{fmt_num(pivots['PDH'],2)}</div></div>
+ <div class="level2 lv-p"><div class="k">PREVIOUS DAY LOW</div><div class="v">{fmt_num(pivots['PDL'],2)}</div></div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2165,7 +2465,7 @@ else:
 
 st.markdown(
     f"""
-<div class="note-box"><b>V10.3 Option Intelligence:</b> Flow <b>{flow['flow_bias']} ({flow['flow_score']}%)</b> • ATM Straddle <b>₹{fmt_num(flow['atm_straddle'],2)}</b> • Premium-implied move <b>{fmt_num(flow['expected_move_pct'],2)}%</b> • Put Vol {compact_num(flow['put_volume'])} vs Call Vol {compact_num(flow['call_volume'])}. Contract selection now ranks near-ATM strikes by spread, volume, OI, Delta and IV.</div>
+<div class="note-box"><b>V11.3 Research Fusion:</b> Flow <b>{flow['flow_bias']} ({flow['flow_score']}%)</b> • ATM Straddle <b>₹{fmt_num(flow['atm_straddle'],2)}</b> • Premium-implied move <b>{fmt_num(flow['expected_move_pct'],2)}%</b> • Put Vol {compact_num(flow['put_volume'])} vs Call Vol {compact_num(flow['call_volume'])}. Contract selection now ranks near-ATM strikes by spread, volume, OI, Delta and IV.</div>
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------
@@ -2321,8 +2621,9 @@ with chart_tab:
 
 with chain_tab:
     st.markdown(f'<div class="option-title"><b>OPTION CHAIN — {selected_market}</b><span>🟢 Support • 🔴 Resistance • 🟡 ATM • 5m execution / 15m trend</span></div>', unsafe_allow_html=True)
-    mobile_compact = st.toggle("📱 Compact mobile option chain", value=False)
+    mobile_compact = st.toggle("📱 Compact option chain", value=False, help="Use this on mobile/tablet for fewer columns and 7 nearest strikes.")
     strike_count = 7 if mobile_compact else 21
+    st.caption("CE (Calls)  ◀  |  STRIKE / ATM  |  ▶  PE (Puts) — 21 nearest strikes on desktop, 7 in compact mode.")
     if df_chain.empty:
         st.info("No live option-chain data loaded. Validate Dhan, load expiries, then refresh.")
         if chain_result.message not in ("Not loaded", ""):
@@ -2337,20 +2638,20 @@ with chain_tab:
         else:
             display = display.head(strike_count)
 
+        # V11.1 clean professional layout: CE | STRIKE | PE.
+        # Keep only decision-useful fields so the chain stays readable on laptop/mobile.
         wanted = [
-            "CE_OI", "CE_OI_CHANGE", "CE_VOLUME", "CE_IV", "CE_DELTA",
-            "CE_THETA", "CE_LTP", "CE_BID", "CE_ASK",
+            "CE_OI", "CE_OI_CHANGE", "CE_VOLUME", "CE_IV", "CE_LTP",
+            "CE_DELTA", "CE_GAMMA", "CE_THETA",
             "Strike",
-            "PE_BID", "PE_ASK", "PE_LTP", "PE_THETA", "PE_DELTA",
-            "PE_IV", "PE_VOLUME", "PE_OI_CHANGE", "PE_OI",
+            "PE_LTP", "PE_DELTA", "PE_GAMMA", "PE_THETA", "PE_IV",
+            "PE_VOLUME", "PE_OI_CHANGE", "PE_OI",
         ]
-        if not mobile_compact:
+        if mobile_compact:
             wanted = [
-                "CE_OI", "CE_OI_CHANGE", "CE_VOLUME", "CE_IV", "CE_DELTA", "CE_GAMMA", "CE_VEGA",
-                "CE_THETA", "CE_LTP", "CE_BID", "CE_ASK",
+                "CE_OI", "CE_OI_CHANGE", "CE_IV", "CE_LTP", "CE_DELTA",
                 "Strike",
-                "PE_BID", "PE_ASK", "PE_LTP", "PE_THETA", "PE_DELTA", "PE_GAMMA", "PE_VEGA",
-                "PE_IV", "PE_VOLUME", "PE_OI_CHANGE", "PE_OI",
+                "PE_LTP", "PE_DELTA", "PE_IV", "PE_OI_CHANGE", "PE_OI",
             ]
         for col in wanted:
             if col not in display:
@@ -2358,13 +2659,11 @@ with chain_tab:
 
         rename = {
             "CE_OI": "CE OI", "CE_OI_CHANGE": "CE Chg OI", "CE_VOLUME": "CE Vol",
-            "CE_IV": "CE IV", "CE_DELTA": "CE Δ", "CE_GAMMA": "CE Γ",
-            "CE_VEGA": "CE Vega", "CE_THETA": "CE Θ",
-            "CE_LTP": "CE LTP", "CE_BID": "CE Bid", "CE_ASK": "CE Ask",
-            "PE_BID": "PE Bid", "PE_ASK": "PE Ask", "PE_LTP": "PE LTP",
-            "PE_THETA": "PE Θ", "PE_DELTA": "PE Δ", "PE_GAMMA": "PE Γ",
-            "PE_VEGA": "PE Vega", "PE_IV": "PE IV",
-            "PE_VOLUME": "PE Vol", "PE_OI_CHANGE": "PE Chg OI", "PE_OI": "PE OI",
+            "CE_IV": "CE IV", "CE_LTP": "CE LTP", "CE_DELTA": "CE Δ",
+            "CE_GAMMA": "CE Γ", "CE_THETA": "CE Θ",
+            "PE_LTP": "PE LTP", "PE_DELTA": "PE Δ", "PE_GAMMA": "PE Γ",
+            "PE_THETA": "PE Θ", "PE_IV": "PE IV", "PE_VOLUME": "PE Vol",
+            "PE_OI_CHANGE": "PE Chg OI", "PE_OI": "PE OI",
         }
         display = display[wanted].rename(columns=rename)
 
@@ -2381,8 +2680,8 @@ with chain_tab:
             height=650,
         )
         st.caption(
-            "🟢 Support = highest Put OI • 🔴 Resistance = highest Call OI • 🟡 ATM strike. "
-            "CE/PE columns are lightly separated by colour; expanded mode also shows Gamma and Vega. "
+            "🟢 Dynamic Support = weighted Put OI + fresh OI build-up • 🔴 Dynamic Resistance = weighted Call OI + fresh OI build-up • 🟡 ATM strike. "
+            "CE/PE sides are separated by colour; expanded mode shows the key Greeks Delta, Gamma and Theta. "
             "Max Pain is an approximation from available OI."
         )
 
@@ -2465,6 +2764,6 @@ with log_tab:
 
 st.markdown("---")
 st.caption(
-    "V10.2 Pro Terminal is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
+    "V11.3 Research Fusion Pro is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
     "Verify the instrument ID, expiry, liquidity, bid–ask spread, charges, and risk before any trade."
 )
