@@ -80,7 +80,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+st_autorefresh(interval=10 * 1000, key="dashboard_refresh")
 # ---------------------------------------------------------------------
 # STYLING
 # ---------------------------------------------------------------------
