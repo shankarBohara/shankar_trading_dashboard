@@ -6,7 +6,7 @@ Install once:
     py -m pip install streamlit requests pandas numpy plotly
 
 Run:
-    py -m streamlit run shankar_trading_dashboard_v11_5.py
+    py -m streamlit run shankar_trading_dashboard_v12.py
 
 Important:
 - This version does NOT place real-money orders.
@@ -45,7 +45,7 @@ except Exception:
 # APP CONFIG
 # ---------------------------------------------------------------------
 APP_NAME = "Shankar Trading Dashboard"
-APP_VERSION = "V11.6 Pro Fusion Explainable"
+APP_VERSION = "V12 Pro Fusion • 10s Auto Refresh"
 DHAN_BASE = "https://api.dhan.co/v2"
 DHAN_AUTH_BASE = "https://auth.dhan.co/app"
 AUTO_RENEW_BEFORE_MINUTES = 60
@@ -729,7 +729,7 @@ def load_config() -> dict[str, Any]:
         "access_token": "",
         "market_ids": {name: data["security_id"] for name, data in DEFAULT_MARKETS.items()},
         "india_vix_security_id": 0,
-        "refresh_seconds": 5,
+        "refresh_seconds": 10,
     }
     try:
         if CONFIG_PATH.exists():
@@ -803,9 +803,22 @@ def renew_dhan_token(client_id: str, access_token: str) -> ApiResult:
         return ApiResult(False, message=f"Token renewal network error: {exc}")
 
 
+def _normalize_totp_secret(secret: str) -> str:
+    """Accept either a Base32 TOTP secret or a full otpauth:// URI and return Base32."""
+    raw = (secret or "").strip()
+    if raw.lower().startswith("otpauth://"):
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(raw)
+            raw = (parse_qs(parsed.query).get("secret") or [""])[0]
+        except Exception:
+            raw = ""
+    return "".join(raw.replace(" ", "").split()).upper()
+
+
 def _totp_code(secret: str, digits: int = 6, period: int = 30) -> str:
     """RFC 6238 TOTP using stdlib only; avoids an extra pyotp dependency."""
-    clean = "".join(secret.strip().replace(" ", "").split()).upper()
+    clean = _normalize_totp_secret(secret)
     padding = "=" * (-len(clean) % 8)
     key = base64.b32decode(clean + padding, casefold=True)
     counter = int(time_module.time() // period)
@@ -818,8 +831,13 @@ def _totp_code(secret: str, digits: int = 6, period: int = 30) -> str:
 
 def generate_dhan_token_totp(client_id: str, pin: str, totp_secret: str) -> ApiResult:
     """Generate a fresh 24-hour Dhan token when TOTP is enabled on the account."""
-    if not client_id.strip() or not pin.strip() or not totp_secret.strip():
+    client_id = client_id.strip()
+    pin = pin.strip()
+    totp_secret = _normalize_totp_secret(totp_secret)
+    if not client_id or not pin or not totp_secret:
         return ApiResult(False, message="Client ID, Dhan PIN and TOTP secret are required.")
+    if not pin.isdigit() or len(pin) != 6:
+        return ApiResult(False, message="Dhan PIN must be exactly 6 numeric digits (official Dhan requirement).")
     try:
         totp = _totp_code(totp_secret)
     except Exception as exc:
@@ -828,7 +846,8 @@ def generate_dhan_token_totp(client_id: str, pin: str, totp_secret: str) -> ApiR
     try:
         response = requests.post(
             f"{DHAN_AUTH_BASE}/generateAccessToken",
-            params={"dhanClientId": client_id.strip(), "pin": pin.strip(), "totp": totp},
+            params={"dhanClientId": client_id, "pin": pin, "totp": totp},
+            headers={"Accept": "application/json"},
             timeout=REQUEST_TIMEOUT,
         )
         elapsed = round((time_module.perf_counter() - started) * 1000)
@@ -841,7 +860,12 @@ def generate_dhan_token_totp(client_id: str, pin: str, totp_secret: str) -> ApiR
         message = body.get("errorMessage") if isinstance(body, dict) else str(body)
         if isinstance(body, dict) and not message:
             message = body.get("message") or body.get("remarks") or body.get("errorCode") or body.get("errorType") or str(body)
-        return ApiResult(False, body, str(message)[:300], response.status_code, elapsed)
+        # Make common auth failures actionable without ever echoing PIN/TOTP/token values.
+        safe_message = str(message)[:300]
+        low = safe_message.lower()
+        if response.status_code in (400, 401, 403) or any(k in low for k in ("totp", "pin", "auth", "invalid")):
+            safe_message += " | Check: Client ID, 6-digit Dhan PIN, TOTP setup secret, and device/server clock. Do not enter the changing 6-digit Authenticator code as DHAN_TOTP_SECRET."
+        return ApiResult(False, body, safe_message, response.status_code, elapsed)
     except requests.Timeout:
         return ApiResult(False, message="Dhan token generation timed out.")
     except requests.RequestException as exc:
@@ -919,7 +943,7 @@ def validate_connection(client_id: str, access_token: str) -> ApiResult:
     return api_call("GET", "/profile", client_id, access_token)
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_resource(ttl=15, show_spinner=False)
 def fetch_expiries(
     client_id: str,
     access_token: str,
@@ -933,7 +957,7 @@ def fetch_expiries(
     return api_call("POST", "/optionchain/expirylist", client_id, access_token, payload)
 
 
-@st.cache_data(ttl=4, show_spinner=False)
+@st.cache_resource(ttl=4, show_spinner=False)
 def fetch_option_chain(
     client_id: str,
     access_token: str,
@@ -949,7 +973,7 @@ def fetch_option_chain(
     return api_call("POST", "/optionchain", client_id, access_token, payload)
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_resource(ttl=30, show_spinner=False)
 def fetch_intraday(
     client_id: str,
     access_token: str,
@@ -972,7 +996,7 @@ def fetch_intraday(
 
 
 
-@st.cache_data(ttl=2, show_spinner=False)
+@st.cache_resource(ttl=2, show_spinner=False)
 def fetch_ltp(
     client_id: str,
     access_token: str,
@@ -1470,7 +1494,7 @@ def entry_chase_filter(df5: pd.DataFrame, sig5: dict[str, Any], bullish: bool) -
 
 
 def pro_fusion_decision(sig5: dict[str, Any], sig15: dict[str, Any], metrics: dict[str, Any], flow: dict[str, Any], regime: dict[str, Any], chase: dict[str, Any], market_open: bool, india_vix: float=np.nan) -> dict[str, Any]:
-    """V11.5: 45% 5m + 30% 15m + 15% option flow + 10% regime, with hard safety gates."""
+    """V12: 45% 5m + 30% 15m + 15% option flow + 10% regime, with hard safety gates."""
     if not sig5.get("available") or not sig15.get("available"):
         return {"action":"WAIT — DATA NOT CONNECTED","confidence":0,"bias":"Neutral","css":"","reason":"Valid 5m and 15m candles are required.","checks":[]}
     aligned=sig5.get("trend")==sig15.get("trend") and sig5.get("trend") in ("Bullish","Bearish")
@@ -1499,13 +1523,13 @@ def pro_fusion_decision(sig5: dict[str, Any], sig15: dict[str, Any], metrics: di
         "raw_regime": int(round(regime_dir)),
     }
     common={"confidence":confidence,"bias":"Bullish" if bullish else "Bearish","css":"","checks":checks,"breakdown":breakdown}
-    if not market_open: return {**common,"action":"MARKET CLOSED — NO FRESH ENTRY","reason":"Analysis can remain visible, but V11.5 blocks fresh entries outside the normal Indian session."}
+    if not market_open: return {**common,"action":"MARKET CLOSED — NO FRESH ENTRY","reason":"Analysis can remain visible, but V12 blocks fresh entries outside the normal Indian session."}
     if flow_conflict: return {**common,"action":"WAIT — OPTION FLOW CONFLICT","confidence":min(confidence,79),"reason":"Trend aligns, but option-chain flow conflicts with the direction."}
     if not chase.get("ok",True): return {**common,"action":"WAIT — DO NOT CHASE","confidence":min(confidence,79),"reason":chase.get("reason","Entry is extended.")}
     if regime_bad: return {**common,"action":"WAIT — MARKET REGIME WEAK","confidence":min(confidence,79),"reason":"Range/chop detected; premium buying needs exceptional evidence."}
-    if confidence>=80: return {**common,"action":"BUY CE SETUP" if bullish else "BUY PE SETUP","css":"buy" if bullish else "sell","reason":"V11.5 Pro Fusion passed trend, flow, regime and entry-location gates."}
+    if confidence>=80: return {**common,"action":"BUY CE SETUP" if bullish else "BUY PE SETUP","css":"buy" if bullish else "sell","reason":"V12 Pro Fusion passed trend, flow, regime and entry-location gates."}
     if confidence>=70: return {**common,"action":"WAIT FOR BULLISH CONFIRMATION" if bullish else "WAIT FOR BEARISH CONFIRMATION","reason":"Alignment exists, but fused confidence is below 80%."}
-    return {**common,"action":"NO TRADE","reason":"Evidence is below V11.5 minimum quality threshold."}
+    return {**common,"action":"NO TRADE","reason":"Evidence is below V12 minimum quality threshold."}
 
 
 def option_flow_intelligence(df: pd.DataFrame, spot: float | None, metrics: dict[str, Any]) -> dict[str, Any]:
@@ -1837,7 +1861,7 @@ def build_trade_plan(
     side = "CE" if action.startswith("BUY CE") else "PE"
     contract = select_best_option_contract(chain, side, metrics)
     if not contract.get("ok"):
-        plan["note"] = "V11.5 blocked contract: " + str(contract.get("reason", "weak liquidity/quality"))
+        plan["note"] = "V12 blocked contract: " + str(contract.get("reason", "weak liquidity/quality"))
         return plan
     entry = safe_float(contract.get("entry"), np.nan)
     if not math.isfinite(entry) or entry <= 0:
@@ -1861,7 +1885,7 @@ def build_trade_plan(
             "t2": entry + 2 * risk,
             "t3": entry + 3 * risk,
             "rr": "1:3",
-            "note": "V11.5 selected liquid near-ATM contract • " + str(contract.get("reason", "")) + ". Confirm 5m candle close before entry.",
+            "note": "V12 selected liquid near-ATM contract • " + str(contract.get("reason", "")) + ". Confirm 5m candle close before entry.",
         }
     )
     return plan
@@ -2129,7 +2153,7 @@ with st.sidebar:
     )
     # Never let an old text-area widget value overwrite a token generated during
     # this Streamlit session. This was the main cause of 'Invalid Token' after a
-    # successful Renew / Generate action in V11.5.
+    # successful Renew / Generate action in V12.
     access_token = (st.session_state.runtime_access_token or access_token_input or seed_token).strip()
 
     st.subheader("♻️ Auto Token Manager")
@@ -2138,7 +2162,7 @@ with st.sidebar:
         value=True,
         help="Renews an active Web token before expiry. Optional TOTP fallback can generate a fresh 24-hour token.",
     )
-    # V11.5: keep token-renew timing automatic so no misleading "60 min" label appears in the trading UI.
+    # V12: keep token-renew timing automatic so no misleading "60 min" label appears in the trading UI.
     renew_before_minutes = AUTO_RENEW_BEFORE_MINUTES
     st.caption("Token renewal timing is managed automatically before expiry.")
     dhan_pin = st.text_input(
@@ -2151,7 +2175,7 @@ with st.sidebar:
         "TOTP Secret (optional fallback)",
         value=read_secret("DHAN_TOTP_SECRET", ""),
         type="password",
-        help="Authenticator setup secret, not the changing 6-digit TOTP code. Prefer Streamlit Secrets.",
+        help="Permanent Base32 setup secret from Dhan TOTP setup (or full otpauth:// URI), NOT the changing 6-digit Authenticator code. Prefer Streamlit Secrets.",
     )
     mins_left = token_minutes_remaining(access_token) if access_token.strip() else None
     if mins_left is not None:
@@ -2238,18 +2262,17 @@ with st.sidebar:
     )
     st.session_state.live_enabled = bool(auto_load)
 
-    refresh_seconds = st.select_slider(
-        "Live refresh interval",
-        options=[3, 5, 10, 15, 30, 60],
-        value=int(config.get("refresh_seconds", 5)),
-        help="Option chain is never requested faster than Dhan's 3-second limit.",
-    )
-    config["refresh_seconds"] = int(refresh_seconds)
+    # V12: fixed 10-second refresh for live trading data.
+    # The widget still lets the user pause refresh temporarily, while the
+    # interval itself stays locked at 10 seconds to avoid accidental API spam.
+    refresh_seconds = 10
+    config["refresh_seconds"] = 10
+    st.caption("⏱️ Live auto-refresh: every 10 seconds")
 
     auto_refresh = st.toggle(
-        "Auto Refresh",
-        value=False,
-        help="Requires streamlit-autorefresh. Manual Refresh still works without it.",
+        "Auto Refresh (10 sec)",
+        value=True,
+        help="Refreshes live dashboard data every 10 seconds while Dhan Live Data is ON. Manual Refresh remains available.",
     )
     refresh_clicked = st.button("🔄 Refresh Now", use_container_width=True)
     if refresh_clicked:
@@ -2282,7 +2305,7 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------
-# AUTO TOKEN MANAGER (V11.6 hardened)
+# AUTO TOKEN MANAGER (V12 hardened)
 # ---------------------------------------------------------------------
 # Design goals:
 # 1) The current runtime/config token wins over the original read-only Secret.
@@ -2443,12 +2466,12 @@ load_live = credentials_present and connection.ok and st.session_state.live_enab
 if auto_refresh and load_live:
     if st_autorefresh is not None:
         st_autorefresh(
-            interval=max(int(refresh_seconds), 3) * 1000,
-            key="v7_live_refresh",
+            interval=10_000,
+            key="v12_live_refresh_10s",
         )
     else:
         st.sidebar.warning(
-            "Auto Refresh requires: py -m pip install streamlit-autorefresh"
+            "10-second Auto Refresh requires: py -m pip install streamlit-autorefresh"
         )
 
 expiries: list[str] = []
@@ -2611,11 +2634,11 @@ trade_plan = build_trade_plan(decision, df_chain, metrics, sig5)
 
 if trade_plan["side"] != "WAIT" and not liquidity["ok"]:
     trade_plan["side"] = "WAIT"
-    trade_plan["note"] = liquidity["reason"] + ". Trade blocked by V11.5 liquidity/data-quality gate."
+    trade_plan["note"] = liquidity["reason"] + ". Trade blocked by V12 liquidity/data-quality gate."
     decision.update({"action":"WAIT — LIQUIDITY BLOCK","css":"","confidence":min(decision.get("confidence",0),79),"reason":liquidity["reason"]})
 
 # ---------------------------------------------------------------------
-# V11.5 PRO FUSION SUMMARY — ONLY 5m EXECUTION + 15m TREND
+# V12 PRO FUSION SUMMARY — ONLY 5m EXECUTION + 15m TREND
 # ---------------------------------------------------------------------
 aligned = sig5["trend"] == sig15["trend"] and sig5["trend"] in ("Bullish", "Bearish")
 alignment_text = sig5["trend"] if aligned else "Mixed"
@@ -2674,7 +2697,7 @@ else:
 
 st.markdown(
     f"""
-<div class="note-box"><b>V11.5 Research Fusion:</b> Flow <b>{flow['flow_bias']} ({flow['flow_score']}%)</b> • ATM Straddle <b>₹{fmt_num(flow['atm_straddle'],2)}</b> • Premium-implied move <b>{fmt_num(flow['expected_move_pct'],2)}%</b> • Put Vol {compact_num(flow['put_volume'])} vs Call Vol {compact_num(flow['call_volume'])}. Contract selection now ranks near-ATM strikes by spread, volume, OI, Delta and IV.</div>
+<div class="note-box"><b>V12 Research Fusion:</b> Flow <b>{flow['flow_bias']} ({flow['flow_score']}%)</b> • ATM Straddle <b>₹{fmt_num(flow['atm_straddle'],2)}</b> • Premium-implied move <b>{fmt_num(flow['expected_move_pct'],2)}%</b> • Put Vol {compact_num(flow['put_volume'])} vs Call Vol {compact_num(flow['call_volume'])}. Contract selection now ranks near-ATM strikes by spread, volume, OI, Delta and IV.</div>
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------
@@ -2748,7 +2771,7 @@ with overview_tab:
         unsafe_allow_html=True,
     )
 
-    st.markdown("### 🧠 V11.5 Why BUY / Why WAIT")
+    st.markdown("### 🧠 V12 Why BUY / Why WAIT")
     checklist_text = " • ".join(decision.get("checks", [])) if decision.get("checks") else "Waiting for complete live data."
     bd = decision.get("breakdown", {})
     if bd:
@@ -2782,7 +2805,7 @@ with overview_tab:
     st.markdown(
         """
 <div class="note-box">
-<b>V11.5 Decision rules:</b> 80%+ = eligible BUY setup; 70–79% = WAIT; below 70% = NO TRADE. Hard gates still block a high score when market is closed, 5m/15m disagree, option flow conflicts, liquidity is weak, regime is choppy, or the 5m entry is extended.
+<b>V12 Decision rules:</b> 80%+ = eligible BUY setup; 70–79% = WAIT; below 70% = NO TRADE. Hard gates still block a high score when market is closed, 5m/15m disagree, option flow conflicts, liquidity is weak, regime is choppy, or the 5m entry is extended.
 </div>
 """,
         unsafe_allow_html=True,
@@ -2796,7 +2819,7 @@ with trade_tab:
         st.markdown(
             """
 <div class="note-box">
-V11.5 shows the exact blocking reason above: market session, timeframe alignment, confidence,
+V12 shows the exact blocking reason above: market session, timeframe alignment, confidence,
 option-flow conflict, market regime, entry-chase protection, liquidity, or missing live option data.
 </div>
 """,
@@ -2986,6 +3009,6 @@ with log_tab:
 
 st.markdown("---")
 st.caption(
-    "V11.6 Research Fusion Pro is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
+    "V12 Research Fusion Pro is a decision-support dashboard only. No dashboard can guarantee profit, and this app does not place real-money orders. "
     "Verify the instrument ID, expiry, liquidity, bid–ask spread, charges, and risk before any trade."
 )
